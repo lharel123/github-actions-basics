@@ -1,0 +1,10 @@
+name: First workflow
+on: push
+
+jobs:
+  first-job:
+    runs-on: ubuntu-latest
+
+steps:
+  - name: orint greeting
+    run: echo "Hello test"
