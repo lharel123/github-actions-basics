@@ -1,0 +1,31 @@
+name: Docker Publish
+
+on:
+  push:
+    brnaches: ["master", "main"]
+
+permissions:
+  contents: read
+  packages: write
+
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container register
+        uses: docker/login-actions@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}/app:latest
