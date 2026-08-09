@@ -1,0 +1,12 @@
+name: Security Test
+
+on: [push[
+
+jobs:
+  test-secret:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Try to print secret
+        env:
+          MY_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: echo "The password is $MY_PASSWORD"
