@@ -1,6 +1,6 @@
-name: Security Test
+me: Security Test
 
-on: [push[
+on: [push]
 
 jobs:
   test-secret:
