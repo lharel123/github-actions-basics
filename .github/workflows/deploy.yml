@@ -2,9 +2,21 @@ name: Deploy to Production
 
 on: workflow_dispatch
 
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploying
-        run: echo "Starting deployment..."
+      - name: Mock SSH Connection
+        run: echo "Connecting to production server at 192.168.1.1..."
+
+      - name: Pull New Image
+        run: |
+          echo "Logging into Registry..."
+          echo "Pulling image ghcr.io/myname/app:latest..."
+
+      - name: Restart Application
+        run: |
+          echo "Stopping old container..."
+          echo "Starting new container..."
+          echo "Deployment Successful!"
