@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#070a13">
+  <title>Legion Arena</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <div id="hud" class="hidden">
+    <div class="hud-top">
+      <div class="bars">
+        <div class="bar hp"><div id="hpFill" class="fill"></div><span id="hpText"></span></div>
+        <div class="bar xp"><div id="xpFill" class="fill"></div><span id="lvText"></span></div>
+        <div class="bar dash"><div id="dashFill" class="fill"></div><span>זינוק</span></div>
+      </div>
+      <div class="stats">
+        <div><small>ניקוד</small><b id="score">0</b></div>
+        <div><small>גל</small><b id="wave">1</b></div>
+        <div><small>זמן</small><b id="time">0:00</b></div>
+        <div><small>הריגות</small><b id="kills">0</b></div>
+      </div>
+      <button id="pauseBtn" class="icon-btn" aria-label="השהה">❚❚</button>
+    </div>
+    <div id="combo"></div>
+    <div id="toggles"></div>
+  </div>
+
+  <div id="announce"></div>
+
+  <section id="menu" class="overlay">
+    <div class="panel">
+      <h1>LEGION <span>ARENA</span></h1>
+      <p class="tag">שרוד כמה שיותר גלים. אסוף ניסיון, בחר שדרוגים, הבס את הבוסים.</p>
+      <button id="startBtn" class="primary">התחל משחק</button>
+      <div class="cols">
+        <div class="controls">
+          <h3>שליטה</h3>
+          <ul id="controlsList"></ul>
+        </div>
+        <div>
+          <h3>טבלת שיאים</h3>
+          <ol id="menuBoard" class="board"><li class="muted">טוען...</li></ol>
+        </div>
+      </div>
+      <p class="muted" id="bestLocal"></p>
+    </div>
+  </section>
+
+  <section id="pause" class="overlay hidden">
+    <div class="panel">
+      <h2>הפסקה</h2>
+      <div id="pauseUpgrades" class="chips"></div>
+      <div class="row">
+        <button id="resumeBtn" class="primary">המשך</button>
+        <button id="quitBtn">יציאה לתפריט</button>
+      </div>
+      <div class="row">
+        <button id="aimBtn"></button>
+        <button id="fireBtn"></button>
+        <button id="muteBtn"></button>
+      </div>
+    </div>
+  </section>
+
+  <section id="levelup" class="overlay hidden">
+    <div class="panel wide">
+      <h2>עלית רמה! <span id="luLevel"></span></h2>
+      <div id="cards"></div>
+      <p class="muted">בחר שדרוג (לחיצה או מקשים 1 / 2 / 3)</p>
+    </div>
+  </section>
+
+  <section id="gameover" class="overlay hidden">
+    <div class="panel">
+      <h2>המשחק נגמר</h2>
+      <div id="finalStats" class="final"></div>
+      <form id="scoreForm" class="row">
+        <input id="nameInput" maxlength="16" placeholder="השם שלך" autocomplete="nickname" required>
+        <button type="submit" class="primary">שמור שיא</button>
+      </form>
+      <p id="submitMsg" class="muted"></p>
+      <ol id="overBoard" class="board"></ol>
+      <div class="row">
+        <button id="againBtn" class="primary">שחק שוב</button>
+        <button id="menuBtn">תפריט</button>
+      </div>
+    </div>
+  </section>
+
+  <script src="game.js"></script>
+</body>
+</html>

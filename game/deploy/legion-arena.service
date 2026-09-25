@@ -1,0 +1,35 @@
+[Unit]
+Description=Legion Arena game server (Tailscale only)
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=legion
+Group=legion
+EnvironmentFile=/etc/legion-arena.env
+WorkingDirectory=/opt/legion-arena
+ExecStart=/usr/bin/env node /opt/legion-arena/server.js
+# The Tailscale IP may not exist yet at boot; keep retrying until it does.
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+StateDirectory=legion-arena
+ReadWritePaths=/var/lib/legion-arena
+
+[Install]
+WantedBy=multi-user.target
