@@ -340,6 +340,7 @@
     }
     for (const c of Object.values(state.clubs)) c.form = [];
     for (const p of Object.values(state.players)) p.st = emptyStats();
+    initMonth(state);
   }
 
   function sortedTable(state, leagueId) {
@@ -441,10 +442,14 @@
         const men = MENTALITIES[s.mentality] || MENTALITIES.balanced;
         const numF = s.onPitch.length / 11;
         const homeF = s.home ? 1.03 : 1;
+        const focus = (s.club.training || {}).focus;
+        const trA = focus === 'attack' ? 1.02 : 1;
+        const trD = focus === 'defense' ? 1.02 : 1;
+        const trC = focus === 'tactical' ? 1.02 : 1;
         s.r = {
-          att: (0.6 * a + 0.3 * m + 0.1 * d) * men.att * numF * homeF,
-          def: (0.55 * d + 0.25 * m + 0.2 * g) * men.def * numF * homeF,
-          ctl: (0.7 * m + 0.15 * a + 0.15 * d) * numF * homeF,
+          att: (0.6 * a + 0.3 * m + 0.1 * d) * men.att * numF * homeF * trA,
+          def: (0.55 * d + 0.25 * m + 0.2 * g) * men.def * numF * homeF * trD,
+          ctl: (0.7 * m + 0.15 * a + 0.15 * d) * numF * homeF * trC,
           gk: g,
         };
       }
@@ -485,10 +490,11 @@
 
       // fatigue
       for (const s of this.sides) {
+        const fitF = (s.club.training || {}).focus === 'fitness' ? 0.85 : 1;
         for (const x of s.onPitch) {
           const p = this.state.players[x.id];
           const phy = p.pos === 'GK' ? 70 : p.at[5] || 60;
-          p.cond = Math.max(20, p.cond - (0.36 - (phy - 60) * 0.004));
+          p.cond = Math.max(20, p.cond - (0.36 - (phy - 60) * 0.004) * fitF);
           s.played[x.id] = (s.played[x.id] || 0) + 1;
         }
       }
@@ -950,10 +956,8 @@
 
   function afterWeek(state) {
     // recovery, injuries, finances
-    for (const p of Object.values(state.players)) {
-      p.cond = Math.min(100, p.cond + 28);
-      if (p.inj > 0) p.inj--;
-    }
+    for (const p of Object.values(state.players)) if (p.inj > 0) p.inj--;
+    weeklyTraining(state);
     for (const c of Object.values(state.clubs)) {
       const wages = squad(state, c.id).reduce((s, p) => s + p.w, 0);
       c.balance += c.income - wages;
@@ -965,8 +969,10 @@
     }
     if (state.mode === 'pro') proWeekly(state);
     if (state.mode === 'manager') boardCheck(state);
+    if (state.pro) state.pro.money = (state.pro.money || 0) + state.players[state.pro.pid].w;
     state.week++;
     if (state.week > SEASON_WEEKS) return endSeason(state);
+    if (monthKeyOf(state, state.week) !== state.monthKey) monthTurn(state);
     return null;
   }
 
@@ -1177,9 +1183,10 @@
   function developPlayer(p, minutesShare) {
     const oldOvr = p.ovr;
     let delta;
-    if (p.age <= 21) delta = Math.round((p.pot - p.ovr) * (0.18 + 0.2 * minutesShare) + gauss() * 1.2);
-    else if (p.age <= 24) delta = Math.round((p.pot - p.ovr) * (0.12 + 0.18 * minutesShare) + gauss());
-    else if (p.age <= 28) delta = Math.round(gauss() * 1.1 + (p.pot > p.ovr ? 0.6 : 0));
+    // part of the yearly growth now happens month by month in monthlyDevelopment()
+    if (p.age <= 21) delta = Math.round((p.pot - p.ovr) * (0.1 + 0.14 * minutesShare) + gauss() * 1.1);
+    else if (p.age <= 24) delta = Math.round((p.pot - p.ovr) * (0.06 + 0.1 * minutesShare) + gauss());
+    else if (p.age <= 28) delta = Math.round(gauss() * 1.1 + (p.pot > p.ovr ? 0.3 : 0));
     else if (p.age <= 30) delta = Math.round(-0.5 + gauss());
     else if (p.age <= 32) delta = Math.round(-1.8 + gauss());
     else delta = Math.round(-3 + gauss() * 1.2);
@@ -1307,12 +1314,15 @@
     state.user.clubId = clubId;
     state.user.expected = expectedPosition(state, clubId);
     state.user.warnings = 0;
+    state.user.confidence = 60;
+    initMonth(state);
     const c = state.clubs[clubId];
     message(state, `ברוך הבא ${pre('ל', c.name)}`, `ההנהלה מצפה לסיים בסביבות מקום ${state.user.expected}.`, { kind: 'board' });
   }
 
   function startManager(state, clubId, managerName) {
-    state.user = { clubId, name: managerName || 'המנג\'ר', expected: expectedPosition(state, clubId), warnings: 0, career: [] };
+    state.user = { clubId, name: managerName || 'המנג\'ר', expected: expectedPosition(state, clubId), warnings: 0, career: [], confidence: 60 };
+    initMonth(state);
     const c = state.clubs[clubId];
     const lg = state.leagues.find((l) => l.id === c.league);
     message(state, `ברוך הבא ${pre('ל', c.name)}!`, `ההנהלה מצפה ממך לסיים בסביבות מקום ${state.user.expected} ${pre('ב', lg.name)}. תקציב העברות: ${money(c.balance)}. חלון ההעברות פתוח עד תחילת ספטמבר.`, { kind: 'board' });
@@ -1372,8 +1382,9 @@
     p.ovr = proOvr(p);
     p.v = valueFor(p.ovr, p.age, p.pot);
     state.players[id] = p;
-    state.pro = { pid: id, xp: {}, focus: 1, career: [], log: [], lastRatings: [], offers: [], fame: 0, caps: 0 };
+    state.pro = { pid: id, xp: {}, focus: 1, intensity: 'normal', trust: 50, money: 0, career: [], log: [], lastRatings: [], offers: [], fame: 0, caps: 0 };
     for (let i = 0; i < 6; i++) state.pro.xp[i] = 0;
+    initMonth(state);
     const club = state.clubs[opts.clubId];
     message(state, `חתמת ${pre('ב', club.name)}!`, `ברוך הבא לקריירה. בגיל 17 אתה מתחיל כשחקן צעיר. תופיע במשחקים לפי הרמה שלך מול המתחרים בעמדה. בחר מוקד אימון כל שבוע כדי להשתפר.`, { kind: 'pro' });
     return p;
@@ -1387,7 +1398,8 @@
     if (!available(p)) return 'out';
     const recent = pro.lastRatings.slice(-4);
     const form = recent.length ? (recent.reduce((s, v) => s + v, 0) / recent.length - 6.6) * 4 : 0;
-    const score = p.ovr + form;
+    const trust = ((pro.trust === undefined ? 50 : pro.trust) - 50) / 8;
+    const score = p.ovr + form + trust;
     const rep = state.clubs[p.c].rep;
     const youth = p.age <= 19 ? 3 : 0; // coaches give teenagers a chance
     if (score + youth >= rep - 4) return 'start';
@@ -1482,7 +1494,8 @@
   }
 
   function proTrain(state) {
-    const gains = trainingGain(state, state.pro.focus, 15);
+    const it = TRAINING_INTENSITY[state.pro.intensity] || TRAINING_INTENSITY.normal;
+    const gains = trainingGain(state, state.pro.focus, 15 * it.dev);
     const p = state.players[state.pro.pid];
     p.v = valueFor(p.ovr, p.age, p.pot);
     return gains;
@@ -1545,6 +1558,570 @@
     pro.offers = [];
   }
 
+  // ---------- monthly cycle: review, awards, board confidence, decisions, training ----------
+  const MONTHS_HE = ['ינואר', 'פברואר', 'מרץ', 'אפריל', 'מאי', 'יוני', 'יולי', 'אוגוסט', 'ספטמבר', 'אוקטובר', 'נובמבר', 'דצמבר'];
+  const TRAINING_FOCUS = {
+    balanced: { label: 'מאוזן', desc: 'התפתחות כללית בלי דגש מיוחד.' },
+    attack: { label: 'התקפה', desc: '+2% לכוח ההתקפי במשחקים. משפר בעיטה וכדרור.' },
+    defense: { label: 'הגנה', desc: '+2% להגנה במשחקים. משפר הגנה ופיזיות.' },
+    tactical: { label: 'טקטיקה', desc: '+2% לשליטה במשחק. משפר מסירה.' },
+    fitness: { label: 'כושר', desc: 'עייפות נמוכה יותר במשחקים, התאוששות מהירה ופחות פציעות.' },
+    youth: { label: 'פיתוח צעירים', desc: 'שחקנים עד גיל 23 מתפתחים מהר יותר, הוותיקים פחות.' },
+    rest: { label: 'מנוחה', desc: 'מורל והתאוששות גבוהים. כמעט בלי התפתחות.' },
+  };
+  const TRAINING_INTENSITY = {
+    light: { label: 'קל', dev: 0.7, recovery: 34, injury: 0.0008 },
+    normal: { label: 'רגיל', dev: 1, recovery: 28, injury: 0.0018 },
+    intense: { label: 'אינטנסיבי', dev: 1.35, recovery: 22, injury: 0.0045 },
+  };
+  const FOCUS_ATTRS = { attack: [1, 3], defense: [4, 5], tactical: [2], fitness: [0, 5] };
+
+  function monthKeyOf(state, week) {
+    const d = weekDate(state, week);
+    return d.getUTCFullYear() * 12 + d.getUTCMonth();
+  }
+  function monthLabel(key) {
+    return `${MONTHS_HE[key % 12]} ${Math.floor(key / 12)}`;
+  }
+  function trainingOf(club) {
+    return club.training || { focus: 'balanced', intensity: 'normal' };
+  }
+  function focusClubId(state) {
+    if (state.mode === 'manager' && state.user) return state.user.clubId;
+    if (state.pro) return state.players[state.pro.pid].c;
+    return null;
+  }
+
+  // Snapshot of the league table, the club's balance and player stats, diffed at month end.
+  function initMonth(state) {
+    state.monthKey = monthKeyOf(state, state.week);
+    const clubId = focusClubId(state);
+    if (!clubId) return;
+    const lg = state.clubs[clubId].league;
+    const table = {};
+    for (const [id, r] of Object.entries(state.tables[lg])) table[id] = { ...r };
+    const players = {};
+    for (const p of Object.values(state.players)) {
+      if (state.clubs[p.c] && state.clubs[p.c].league === lg) players[p.id] = [p.st.app, p.st.rt, p.st.gl, p.st.as];
+    }
+    const pos = sortedTable(state, lg).findIndex((r) => r.id === clubId) + 1;
+    state.monthSnap = { clubId, league: lg, table, players, balance: state.clubs[clubId].balance, pos, ovr: state.pro ? state.players[state.pro.pid].ovr : null, fame: state.pro ? state.pro.fame : 0 };
+  }
+
+  function weeklyTraining(state) {
+    for (const c of Object.values(state.clubs)) {
+      const tr = trainingOf(c);
+      const it = TRAINING_INTENSITY[tr.intensity] || TRAINING_INTENSITY.normal;
+      const rec = it.recovery + (tr.focus === 'fitness' ? 4 : 0) + (tr.focus === 'rest' ? 8 : 0);
+      const injP = it.injury * (tr.focus === 'fitness' ? 0.6 : 1) * (tr.focus === 'rest' ? 0.4 : 1);
+      for (const p of squad(state, c.id)) {
+        if (state.pro && p.id === state.pro.pid) continue;
+        p.cond = Math.min(100, p.cond + rec);
+        if (tr.focus === 'rest') p.morale = Math.min(100, p.morale + 1);
+        if (p.inj <= 0 && rnd() < injP) {
+          p.inj = rint(1, 4);
+          if (state.mode === 'manager' && state.user && c.id === state.user.clubId) {
+            message(state, `${p.n} נפצע באימון`, `${p.n} ייעדר כ-${p.inj} שבועות.`, { kind: 'injury' });
+          }
+        }
+      }
+    }
+    if (state.pro) {
+      const p = state.players[state.pro.pid];
+      const it = TRAINING_INTENSITY[state.pro.intensity] || TRAINING_INTENSITY.normal;
+      p.cond = Math.min(100, p.cond + it.recovery);
+      if (p.inj <= 0 && rnd() < it.injury * 1.5) {
+        p.inj = rint(1, 3);
+        message(state, 'נפצעת באימון', `תיעדר כ-${p.inj} שבועות. אימון קל יותר מקטין את הסיכון.`, { kind: 'pro' });
+      }
+    }
+  }
+
+  function monthlyDevelopment(state) {
+    for (const p of Object.values(state.players)) {
+      if (state.pro && p.id === state.pro.pid) continue;
+      const club = state.clubs[p.c];
+      if (!club) continue;
+      const tr = trainingOf(club);
+      const it = TRAINING_INTENSITY[tr.intensity] || TRAINING_INTENSITY.normal;
+      let chance = p.age <= 21 ? 0.3 : p.age <= 24 ? 0.18 : p.age <= 28 ? 0.05 : 0;
+      if (tr.focus === 'youth') chance *= p.age <= 23 ? 1.45 : 0.6;
+      if (tr.focus === 'rest') chance *= 0.3;
+      chance *= it.dev;
+      if (p.ovr < p.pot && rnd() < chance) {
+        p.ovr++;
+        const idxs = FOCUS_ATTRS[tr.focus] || [rint(0, 5)];
+        for (const i of idxs) if (!(p.pos === 'GK' && i === 4)) p.at[i] = Math.min(99, p.at[i] + 1);
+        p.v = valueFor(p.ovr, p.age, p.pot);
+      } else if (p.age >= 31 && rnd() < 0.06 * (tr.intensity === 'intense' ? 1.3 : 1)) {
+        p.ovr = Math.max(40, p.ovr - 1);
+        p.v = valueFor(p.ovr, p.age, p.pot);
+      }
+    }
+  }
+
+  function expectedPpg(state, clubId, expected) {
+    const n = clubsIn(state, state.clubs[clubId].league).length;
+    return 2.2 - ((expected - 1) / Math.max(1, n - 1)) * 1.45;
+  }
+
+  function monthTurn(state) {
+    const snap = state.monthSnap;
+    const label = monthLabel(state.monthKey);
+    monthlyDevelopment(state);
+    const review = { key: state.monthKey, label, mode: state.mode, decisions: [], news: [] };
+    if (snap && state.clubs[snap.clubId]) {
+      const clubId = snap.clubId;
+      const lg = snap.league;
+      const table = state.tables[lg];
+      const diff = (id) => {
+        const a = table[id];
+        const b = snap.table[id] || { p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, pts: 0 };
+        return { p: a.p - b.p, w: a.w - b.w, d: a.d - b.d, l: a.l - b.l, gf: a.gf - b.gf, ga: a.ga - b.ga, pts: a.pts - b.pts };
+      };
+      const cur = state.players[state.pro ? state.pro.pid : 0];
+      const clubNow = state.pro ? cur.c : clubId;
+      if (table[clubNow]) {
+        const me = diff(clubNow);
+        review.club = { id: clubNow, ...me, posFrom: snap.pos, posTo: sortedTable(state, lg).findIndex((r) => r.id === clubNow) + 1, balanceDelta: state.clubs[clubNow].balance - snap.balance };
+      }
+      // player of the month (the user's club and the whole league)
+      const month = [];
+      for (const p of Object.values(state.players)) {
+        const s0 = snap.players[p.id];
+        if (!s0 || !state.clubs[p.c] || state.clubs[p.c].league !== lg) continue;
+        const app = p.st.app - s0[0];
+        if (app < 2) continue;
+        month.push({ pid: p.id, name: p.n, club: p.c, app, rating: Math.round(((p.st.rt - s0[1]) / app) * 100) / 100, gl: p.st.gl - s0[2], as: p.st.as - s0[3] });
+      }
+      month.sort((a, b) => b.rating - a.rating || b.gl - a.gl);
+      review.leaguePotm = month[0] || null;
+      review.clubPotm = month.find((m) => m.club === clubNow) || null;
+      // manager of the month: most points in the league this month
+      const byPts = Object.keys(table).map((id) => ({ id, ...diff(id) })).filter((r) => r.p > 0)
+        .sort((a, b) => b.pts / b.p - a.pts / a.p || (b.gf - b.ga) - (a.gf - a.ga));
+      if (byPts.length) review.motm = { clubId: byPts[0].id, pts: byPts[0].pts, p: byPts[0].p };
+
+      if (state.mode === 'manager' && state.user) {
+        const u = state.user;
+        if (u.confidence === undefined) u.confidence = 60;
+        const from = u.confidence;
+        const reasons = [];
+        let delta = 0;
+        if (review.club && review.club.p > 0) {
+          const ppg = review.club.pts / review.club.p;
+          const exp = expectedPpg(state, clubId, u.expected);
+          const d = clamp(Math.round((ppg - exp) * 14), -14, 12);
+          delta += d;
+          reasons.push(`${review.club.pts} נקודות מ-${review.club.p} משחקים (${d >= 0 ? '+' : ''}${d})`);
+        }
+        const bal = state.clubs[clubId].balance;
+        if (bal < 0) {
+          delta -= 5;
+          reasons.push('יתרה שלילית (-5)');
+        }
+        if (review.motm && review.motm.clubId === clubId) {
+          delta += 5;
+          reasons.push('מאמן החודש (+5)');
+          review.userMotm = true;
+          message(state, 'מאמן החודש!', `זכית בפרס מאמן החודש של ${label}.`, { kind: 'board' });
+        }
+        u.confidence = clamp(from + delta + (u.confidenceBonus || 0), 0, 100);
+        if (u.confidenceBonus) reasons.push(`החלטות החודש (${u.confidenceBonus > 0 ? '+' : ''}${u.confidenceBonus})`);
+        u.confidenceBonus = 0;
+        review.confidence = { from, to: u.confidence, reasons };
+        if (u.confidence < 12) review.fired = true;
+        // promises made last month
+        for (const p of squad(state, clubId)) {
+          if (!p.promise) continue;
+          const s0 = snap.players[p.id];
+          const apps = s0 ? p.st.app - s0[0] : p.st.app;
+          if (apps < 2) {
+            p.morale = clamp(p.morale - 30, 5, 100);
+            review.news.push(`${p.n} כועס: הבטחת לו דקות משחק ולא עמדת בזה.`);
+          }
+          p.promise = 0;
+        }
+      }
+      if (state.pro) {
+        const pro = state.pro;
+        const s0 = snap.players[cur.id] || [0, 0, 0, 0];
+        const app = cur.st.app - s0[0];
+        review.pro = {
+          app, gl: cur.st.gl - s0[2], as: cur.st.as - s0[3], rating: app ? Math.round(((cur.st.rt - s0[1]) / app) * 100) / 100 : 0,
+          ovrFrom: snap.ovr, ovrTo: cur.ovr, fame: Math.round(pro.fame - snap.fame),
+        };
+        if (review.leaguePotm && review.leaguePotm.pid === cur.id) {
+          review.pro.award = true;
+          pro.fame += 10;
+          pro.awards = (pro.awards || 0) + 1;
+          message(state, 'שחקן החודש!', `נבחרת לשחקן החודש של ${label} בליגה.`, { kind: 'pro' });
+        }
+      }
+    }
+    review.decisions = pickDecisions(state);
+    review.training = state.mode === 'manager' && state.user ? { ...trainingOf(state.clubs[state.user.clubId]) } : state.pro ? { focus: state.pro.focus, intensity: state.pro.intensity || 'normal' } : null;
+    state.pendingMonth = review;
+    initMonth(state);
+    return review;
+  }
+
+  function closeMonth(state) {
+    const r = state.pendingMonth;
+    if (!r) return true;
+    if (r.decisions.some((d) => d.answer === null)) return false;
+    state.monthHistory = state.monthHistory || [];
+    state.monthHistory.unshift({ key: r.key, label: r.label, club: r.club, confidence: r.confidence, pro: r.pro, decisions: r.decisions.map((d) => ({ title: d.title, choice: d.options[d.answer].label, result: d.result })) });
+    if (state.monthHistory.length > 40) state.monthHistory.length = 40;
+    state.pendingMonth = null;
+    return true;
+  }
+
+  function setTraining(state, focus, intensity) {
+    if (state.mode === 'manager') {
+      const c = state.clubs[state.user.clubId];
+      c.training = { focus: TRAINING_FOCUS[focus] ? focus : 'balanced', intensity: TRAINING_INTENSITY[intensity] ? intensity : 'normal' };
+    } else if (state.pro) {
+      if (typeof focus === 'number') state.pro.focus = focus;
+      if (TRAINING_INTENSITY[intensity]) state.pro.intensity = intensity;
+    }
+  }
+
+  // ----- decisions -----
+  const pickP = (state, pid) => state.players[pid];
+  const DECISIONS = {
+    unhappy: {
+      mode: 'manager', weight: 3,
+      find(state, club) {
+        const snap = state.monthSnap;
+        const sq = squad(state, club.id).sort((a, b) => b.ovr - a.ovr).slice(0, 16);
+        const c = sq.filter((p) => !p.promise && p.inj <= 0 && p.morale < 70 && (!snap.players[p.id] || p.st.app - snap.players[p.id][0] <= 1));
+        const p = c.length ? pick(c) : null;
+        return p ? { pid: p.id } : null;
+      },
+      build: (state, { pid }) => ({
+        title: `${pickP(state, pid).n} לא מרוצה`, body: `${pickP(state, pid).n} דופק על הדלת: הוא כמעט לא משחק ורוצה לדעת מה העתיד שלו.`,
+        options: [
+          { label: 'להבטיח לו דקות', hint: 'מורל +25. אם לא ישחק לפחות 2 משחקים בחודש הבא, המורל יקרוס.' },
+          { label: 'להכניס לרשימת העברות', hint: 'יגיעו הצעות. מורל -5.' },
+          { label: 'להגיד לו להילחם על מקומו', hint: 'מורל -12.' },
+        ],
+      }),
+      apply(state, { pid }, o) {
+        const p = pickP(state, pid);
+        if (!p) return 'השחקן כבר לא במועדון.';
+        if (o === 0) { p.morale = clamp(p.morale + 25, 0, 100); p.promise = 1; return `${p.n} מרוצה. עכשיו צריך לעמוד בהבטחה.`; }
+        if (o === 1) { p.listed = true; p.morale = clamp(p.morale - 5, 0, 100); return `${p.n} ברשימת ההעברות.`; }
+        p.morale = clamp(p.morale - 12, 0, 100);
+        return `${p.n} יצא מהחדר מאוכזב.`;
+      },
+    },
+    contract: {
+      mode: 'manager', weight: 3,
+      find(state, club) {
+        const sq = squad(state, club.id).sort((a, b) => b.ovr - a.ovr).slice(0, 6).filter((p) => p.ctr <= state.seasonYear + 1 && !p.renewAsked);
+        return sq.length ? { pid: sq[0].id } : null;
+      },
+      build: (state, { pid }) => {
+        const p = pickP(state, pid);
+        return {
+          title: `${p.n} רוצה חוזה חדש`, body: `החוזה של ${p.n} מסתיים ב-${p.ctr}. הסוכן שלו דורש העלאה של 30% בשכר (${money(Math.round(p.w * 1.3))} לשבוע).`,
+          options: [
+            { label: 'לחתום בתנאים שלו', hint: 'חוזה ל-3 שנים נוספות, מורל +10.' },
+            { label: 'להציע 15%', hint: 'סיכוי של כ-50% שיסכים.' },
+            { label: 'לסרב', hint: 'מורל -25, השחקן יבקש לעזוב.' },
+          ],
+        };
+      },
+      apply(state, { pid }, o) {
+        const p = pickP(state, pid);
+        if (!p) return 'השחקן כבר לא במועדון.';
+        p.renewAsked = 1;
+        if (o === 0 || (o === 1 && rnd() < 0.5)) {
+          p.w = Math.round(p.w * (o === 0 ? 1.3 : 1.15));
+          p.ctr = state.seasonYear + 3;
+          p.morale = clamp(p.morale + 10, 0, 100);
+          return `${p.n} חתם על חוזה עד ${p.ctr}.`;
+        }
+        p.morale = clamp(p.morale - 25, 0, 100);
+        p.listed = true;
+        return `${p.n} סירב והכניס את עצמו לרשימת ההעברות.`;
+      },
+    },
+    sponsor: {
+      mode: 'manager', weight: 2,
+      find: (state, club) => ({ amount: Math.round((club.income * (3 + rnd() * 3)) / 10000) * 10000 }),
+      build: (state, { amount }) => ({
+        title: 'הצעת חסות', body: `חברה מקומית מציעה ${money(amount)} תמורת אירוע קידום מכירות עם השחקנים באמצע השבוע.`,
+        options: [{ label: 'לקבל', hint: `+${money(amount)}, כושר השחקנים -10 בשבוע הקרוב.` }, { label: 'לסרב', hint: 'השחקנים ינוחו.' }],
+      }),
+      apply(state, { amount }, o) {
+        const club = state.clubs[state.user.clubId];
+        if (o !== 0) return 'ההצעה נדחתה.';
+        club.balance += amount;
+        for (const p of squad(state, club.id)) p.cond = Math.max(40, p.cond - 10);
+        return `${money(amount)} נכנסו לקופה.`;
+      },
+    },
+    media: {
+      mode: 'manager', weight: 2,
+      find(state, club) {
+        const snap = state.monthSnap;
+        const t = state.tables[club.league][club.id];
+        const b = snap.table[club.id];
+        return b && t.l - b.l >= 2 ? {} : null;
+      },
+      build: () => ({
+        title: 'מסיבת עיתונאים סוערת', body: 'אחרי חודש עם הפסדים, העיתונאים שואלים אם השחקנים עדיין מאמינים בך.',
+        options: [
+          { label: 'לגבות את השחקנים', hint: 'מורל +4 לכל הסגל.' },
+          { label: 'לבקר אותם בפומבי', hint: 'מורל -6, אבל ההנהלה אוהבת נוקשות (+4 אמון).' },
+          { label: 'אין תגובה', hint: 'בלי השפעה.' },
+        ],
+      }),
+      apply(state, p, o) {
+        const sq = squad(state, state.user.clubId);
+        if (o === 0) { sq.forEach((x) => { x.morale = clamp(x.morale + 4, 0, 100); }); return 'השחקנים מעריכים את הגיבוי.'; }
+        if (o === 1) { sq.forEach((x) => { x.morale = clamp(x.morale - 6, 0, 100); }); state.user.confidenceBonus = (state.user.confidenceBonus || 0) + 4; return 'ההנהלה מרוצה, בחדר ההלבשה פחות.'; }
+        return 'העיתונאים יצאו בידיים ריקות.';
+      },
+    },
+    youth: {
+      mode: 'manager', weight: 2,
+      find(state, club) {
+        const lg = state.leagues.find((l) => l.id === club.league);
+        const pos = pick(['ST', 'CAM', 'CB', 'LW', 'RW', 'CM', 'GK', 'RB', 'LB']);
+        const nm = randomName(state, lg.country);
+        return { pos, name: nm.name, nat: nm.nat, ovr: clamp(Math.round(club.rep - 18 + gauss() * 3), 42, 68), pot: clamp(Math.round(club.rep + 6 + gauss() * 4), 70, 93) };
+      },
+      build: (state, y) => ({
+        title: 'כישרון במחלקת הנוער', body: `מאמן הנוער ממליץ על ${y.name} (${POS_HE[y.pos]}, בן 16). יכולת נוכחית ${y.ovr}, והוא חושב שיש בו פוטנציאל גבוה מאוד.`,
+        options: [{ label: 'להחתים חוזה מקצועני', hint: `שכר ${money(wageFor(y.ovr))} לשבוע.` }, { label: 'לוותר', hint: 'קבוצה אחרת כנראה תחתים אותו.' }],
+      }),
+      apply(state, y, o) {
+        if (o !== 0) return `${y.name} חתם בקבוצה יריבה.`;
+        const club = state.clubs[state.user.clubId];
+        const lg = state.leagues.find((l) => l.id === club.league);
+        const p = createPlayer(state, club.id, y.pos, 16, y.ovr, y.pot, lg.country);
+        p.n = y.name;
+        p.fn = y.name;
+        p.nat = y.nat;
+        return `${y.name} הצטרף לסגל.`;
+      },
+    },
+    physio: {
+      mode: 'manager', weight: 3,
+      find(state, club) {
+        const inj = squad(state, club.id).filter((p) => p.inj >= 2);
+        return inj.length >= 3 ? { n: inj.length, cost: Math.round((club.income * 0.8) / 10000) * 10000 } : null;
+      },
+      build: (state, { n, cost }) => ({
+        title: 'משבר פציעות', body: `${n} שחקנים פצועים. הצוות הרפואי מציע להביא פיזיותרפיסט מומחה.`,
+        options: [{ label: 'להביא מומחה', hint: `עלות ${money(cost)}. זמן ההחלמה יורד בשבועיים.` }, { label: 'לא עכשיו', hint: '' }],
+      }),
+      apply(state, { cost }, o) {
+        if (o !== 0) return 'הצוות ימשיך לבד.';
+        const club = state.clubs[state.user.clubId];
+        club.balance -= cost;
+        for (const p of squad(state, club.id)) if (p.inj > 0) p.inj = Math.max(0, p.inj - 2);
+        return 'המומחה הגיע וההחלמה מתקצרת.';
+      },
+    },
+    bonding: {
+      mode: 'manager', weight: 1,
+      find: (state, club) => ({ cost: Math.round((club.income * 0.5) / 10000) * 10000 }),
+      build: (state, { cost }) => ({
+        title: 'גיבוש קבוצתי', body: 'הקפטן מציע לצאת לסוף שבוע של גיבוש.',
+        options: [{ label: 'לצאת לגיבוש', hint: `עלות ${money(cost)}, מורל +8 לכולם.` }, { label: 'לא הפעם', hint: '' }],
+      }),
+      apply(state, { cost }, o) {
+        if (o !== 0) return 'הקבוצה נשארת בשגרה.';
+        state.clubs[state.user.clubId].balance -= cost;
+        squad(state, state.user.clubId).forEach((x) => { x.morale = clamp(x.morale + 8, 0, 100); });
+        return 'אווירה מצוינת בחדר ההלבשה.';
+      },
+    },
+    tickets: {
+      mode: 'manager', weight: 1,
+      find: () => ({}),
+      build: () => ({
+        title: 'מחירי הכרטיסים', body: 'ארגוני האוהדים מתלוננים על מחירי הכרטיסים. מנהל הכספים רוצה דווקא להעלות אותם.',
+        options: [
+          { label: 'להוריד מחירים', hint: 'הכנסה -3%, אמון ההנהלה +3, מורל +2.' },
+          { label: 'להעלות מחירים', hint: 'הכנסה +4%, אמון ההנהלה -3.' },
+          { label: 'להשאיר', hint: '' },
+        ],
+      }),
+      apply(state, p, o) {
+        const club = state.clubs[state.user.clubId];
+        if (o === 0) { club.income = Math.round(club.income * 0.97); state.user.confidenceBonus = (state.user.confidenceBonus || 0) + 3; squad(state, club.id).forEach((x) => { x.morale = clamp(x.morale + 2, 0, 100); }); return 'האוהדים מריעים לך.'; }
+        if (o === 1) { club.income = Math.round(club.income * 1.04); state.user.confidenceBonus = (state.user.confidenceBonus || 0) - 3; return 'הקופה מרוצה, היציע פחות.'; }
+        return 'המחירים נשארים.';
+      },
+    },
+    boardSell: {
+      mode: 'manager', weight: 5,
+      find(state, club) {
+        if (club.balance >= 0) return null;
+        const p = squad(state, club.id).sort((a, b) => b.w - a.w)[0];
+        return p ? { pid: p.id } : null;
+      },
+      build: (state, { pid }) => ({
+        title: 'ההנהלה דורשת לקצץ', body: `הקופה במינוס. ההנהלה רוצה למכור את ${pickP(state, pid).n}, בעל השכר הגבוה בסגל.`,
+        options: [{ label: 'למכור (80% מהשווי)', hint: 'הקופה מתאזנת.' }, { label: 'לסרב', hint: 'אמון ההנהלה -12.' }],
+      }),
+      apply(state, { pid }, o) {
+        const p = pickP(state, pid);
+        if (o !== 0 || !p) { state.user.confidenceBonus = (state.user.confidenceBonus || 0) - 12; return 'ההנהלה לא מרוצה מהסירוב.'; }
+        const buyers = Object.values(state.clubs).filter((c) => c.id !== p.c && c.rep >= p.ovr - 6);
+        const buyer = buyers.length ? pick(buyers) : pick(Object.values(state.clubs).filter((c) => c.id !== p.c));
+        transfer(state, p, buyer.id, Math.round((p.v * 0.8) / 10000) * 10000);
+        return `${p.n} נמכר ${pre('ל', buyer.name)}.`;
+      },
+    },
+    // ----- Be a Pro -----
+    agent: {
+      mode: 'pro', weight: 2,
+      find: (state) => (state.pro.lastRatings.length >= 3 ? {} : null),
+      build: (state) => ({
+        title: 'הסוכן שלך מתקשר', body: `לדעת הסוכן אתה שווה יותר מ-${money(state.players[state.pro.pid].w)} לשבוע. הוא רוצה לדרוש העלאה.`,
+        options: [{ label: 'לדרוש העלאה', hint: 'מצליח אם שיחקת טוב לאחרונה. כישלון יפגע במאמן.' }, { label: 'להישאר נאמן', hint: 'אמון המאמן +4.' }],
+      }),
+      apply(state, p, o) {
+        const pro = state.pro;
+        const pl = state.players[pro.pid];
+        if (o === 1) { pro.trust = clamp((pro.trust || 50) + 4, 0, 100); return 'המאמן מעריך את הנאמנות.'; }
+        const avg = pro.lastRatings.reduce((s, v) => s + v, 0) / pro.lastRatings.length;
+        if (avg >= 6.9 && rnd() < 0.75) { pl.w = Math.round(pl.w * 1.4); return `קיבלת העלאה! השכר החדש: ${money(pl.w)} לשבוע.`; }
+        pro.trust = clamp((pro.trust || 50) - 6, 0, 100);
+        pl.morale = clamp(pl.morale - 8, 0, 100);
+        return 'המועדון סירב, והמאמן לא אהב את הדרישה.';
+      },
+    },
+    interview: {
+      mode: 'pro', weight: 2,
+      find: () => ({}),
+      build: () => ({
+        title: 'ראיון בטלוויזיה', body: 'עיתונאי שואל איפה אתה רואה את עצמך בעוד שלוש שנים.',
+        options: [{ label: '"מתמקד בקבוצה שלי"', hint: 'אמון המאמן +3.' }, { label: '"בקבוצה הכי גדולה באירופה"', hint: 'מוניטין +6, המאמן פחות אוהב (-3).' }],
+      }),
+      apply(state, p, o) {
+        const pro = state.pro;
+        if (o === 0) { pro.trust = clamp((pro.trust || 50) + 3, 0, 100); return 'תשובה צנועה ובוגרת.'; }
+        pro.fame += 6;
+        pro.trust = clamp((pro.trust || 50) - 3, 0, 100);
+        return 'הכותרות אוהבות אותך, חדר ההלבשה פחות.';
+      },
+    },
+    extra: {
+      mode: 'pro', weight: 3,
+      find: () => ({}),
+      build: (state) => ({
+        title: 'אימון נוסף?', body: `המאמן מציע אימונים אישיים נוספים ב${(state.players[state.pro.pid].pos === 'GK' ? GK_ATTR_HE : ATTR_HE)[state.pro.focus]}.`,
+        options: [{ label: 'להתאמן עוד', hint: '+45 נקודות ניסיון, כושר -15 בשבוע הקרוב.' }, { label: 'לנוח', hint: 'כושר ומורל עולים.' }],
+      }),
+      apply(state, p, o) {
+        const pl = state.players[state.pro.pid];
+        if (o === 0) { const g = trainingGain(state, state.pro.focus, 45); pl.cond = Math.max(40, pl.cond - 15); return g.length ? `עבודה קשה משתלמת: הדירוג עלה ל-${pl.ovr}.` : 'עוד צעד קדימה באימונים.'; }
+        pl.cond = 100;
+        pl.morale = clamp(pl.morale + 3, 0, 100);
+        return 'נחת וטעינת מצברים.';
+      },
+    },
+    party: {
+      mode: 'pro', weight: 1,
+      find: () => ({}),
+      build: () => ({
+        title: 'הזמנה למסיבה', body: 'כמה שחקנים מהקבוצה יוצאים למסיבה יומיים לפני משחק.',
+        options: [{ label: 'להצטרף', hint: 'מורל +8, אבל יש סיכון שהמאמן יגלה.' }, { label: 'להישאר בבית', hint: '+10 נקודות ניסיון.' }],
+      }),
+      apply(state, p, o) {
+        const pro = state.pro;
+        const pl = state.players[pro.pid];
+        if (o === 1) { trainingGain(state, pro.focus, 10); return 'לילה שקט ושינה טובה.'; }
+        pl.morale = clamp(pl.morale + 8, 0, 100);
+        if (rnd() < 0.35) { pro.trust = clamp((pro.trust || 50) - 8, 0, 100); return 'המאמן גילה. אמון המאמן ירד.'; }
+        return 'היה כיף, ואף אחד לא גילה.';
+      },
+    },
+    coachTalk: {
+      mode: 'pro', weight: 4,
+      find: (state) => (proSquadRole(state) !== 'start' ? {} : null),
+      build: () => ({
+        title: 'שיחה עם המאמן', body: 'אתה לא פותח בהרכב. איך לגשת לזה?',
+        options: [{ label: 'לדרוש יותר דקות', hint: 'סיכוי של 50% לאמון +8. אחרת -5.' }, { label: 'לעבוד קשה יותר', hint: '+30 נקודות ניסיון, אמון +3.' }],
+      }),
+      apply(state, p, o) {
+        const pro = state.pro;
+        if (o === 1) { trainingGain(state, pro.focus, 30); pro.trust = clamp((pro.trust || 50) + 3, 0, 100); return 'המאמן שם לב למאמץ.'; }
+        if (rnd() < 0.5) { pro.trust = clamp((pro.trust || 50) + 8, 0, 100); return 'המאמן הבטיח לתת לך הזדמנות.'; }
+        pro.trust = clamp((pro.trust || 50) - 5, 0, 100);
+        return 'המאמן לא אהב את הטון.';
+      },
+    },
+    boots: {
+      mode: 'pro', weight: 2,
+      find: (state) => (state.pro.fame >= 12 && !state.pro.bootsDeal ? { amount: Math.round((20000 + state.pro.fame * 4000) / 1000) * 1000 } : null),
+      build: (state, { amount }) => ({
+        title: 'חוזה נעליים', body: `חברת ציוד ספורט מציעה לך ${money(amount)} לעונה.`,
+        options: [{ label: 'לחתום', hint: 'כסף ומוניטין +3.' }, { label: 'לחכות להצעה גדולה יותר', hint: '' }],
+      }),
+      apply(state, { amount }, o) {
+        if (o !== 0) return 'אולי בפעם הבאה.';
+        state.pro.bootsDeal = 1;
+        state.pro.money = (state.pro.money || 0) + amount;
+        state.pro.fame += 3;
+        return `חתמת! ${money(amount)} נכנסו לחשבון.`;
+      },
+    },
+    mentor: {
+      mode: 'pro', weight: 2,
+      find: (state) => (state.players[state.pro.pid].age <= 21 ? {} : null),
+      build: () => ({
+        title: 'שחקן ותיק מציע עזרה', body: 'הקפטן מציע להישאר אחרי האימונים ולעבוד איתך.',
+        options: [{ label: 'בשמחה', hint: '+25 נקודות ניסיון בתכונה אקראית.' }, { label: 'אני מסתדר לבד', hint: '' }],
+      }),
+      apply(state, p, o) {
+        if (o !== 0) return 'בסדר, אתה סומך על עצמך.';
+        trainingGain(state, rint(0, 5), 25);
+        state.pro.trust = clamp((state.pro.trust || 50) + 2, 0, 100);
+        return 'למדת כמה טריקים מהוותיק.';
+      },
+    },
+  };
+
+  function pickDecisions(state) {
+    const clubId = focusClubId(state);
+    if (!clubId) return [];
+    const club = state.clubs[clubId];
+    const recent = state.recentDecisions || [];
+    const cands = [];
+    for (const [type, d] of Object.entries(DECISIONS)) {
+      if (d.mode !== state.mode || recent.includes(type)) continue;
+      const params = d.find(state, club);
+      if (params) cands.push({ type, params, weight: d.weight });
+    }
+    const out = [];
+    const n = rnd() < 0.5 ? 1 : 2;
+    while (out.length < n && cands.length) {
+      const c = weighted(cands, (x) => x.weight);
+      cands.splice(cands.indexOf(c), 1);
+      const b = DECISIONS[c.type].build(state, c.params);
+      out.push({ type: c.type, params: c.params, title: b.title, body: b.body, options: b.options, answer: null, result: null });
+    }
+    state.recentDecisions = recent.concat(out.map((d) => d.type)).slice(-4);
+    return out;
+  }
+
+  function answerDecision(state, idx, option) {
+    const r = state.pendingMonth;
+    if (!r || !r.decisions[idx] || r.decisions[idx].answer !== null) return null;
+    const d = r.decisions[idx];
+    d.answer = option;
+    d.result = DECISIONS[d.type].apply(state, d.params, option);
+    return d.result;
+  }
+
   // ---------- helpers ----------
   function money(v) {
     const a = Math.abs(v);
@@ -1573,5 +2150,6 @@
     expectedPosition, jobOffers, takeJob, valueFor, wageFor,
     proStartOffers, createPro, proSquadRole, proMatchSim, proAfterMatch, proAcceptOffer, proDeclineOffers, proOvr, proWeightKey,
     money, seasonLabel, avgRating, message, pre,
+    TRAINING_FOCUS, TRAINING_INTENSITY, monthLabel, monthKeyOf, closeMonth, answerDecision, setTraining, trainingOf, initMonth,
   };
 });

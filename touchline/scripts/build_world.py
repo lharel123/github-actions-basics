@@ -7,15 +7,19 @@ Sources:
     https://github.com/ismailoksuz/EAFC26-DataHub  (data/players.csv)
   * kadishay/israeli-league-charts - the real 2025/26 Ligat ha'Al and Liga Leumit clubs,
     their Hebrew names and kit colours. https://github.com/kadishay/israeli-league-charts
-    No open source for Israeli squads was reachable, so Israeli players are generated
-    (flagged with "gen": 1) and can be replaced by editing world.json.
+  * salimt/football-datasets (Transfermarkt, Oct 2025) - the real players it has for the
+    Israeli clubs (about 90), with Hebrew names, positions, ages and market values.
+    https://github.com/salimt/football-datasets
+    No open source has complete Israeli squads, so each squad is filled up to 26 with
+    generated players (flagged with "gen": 1); they can be replaced by editing world.json.
 
 Usage:
-  python3 scripts/build_world.py path/to/players.csv path/to/israeli-league-charts
+  python3 scripts/build_world.py path/to/players.csv path/to/israeli-league-charts [path/to/football-datasets]
 """
 
 import csv
 import json
+import math
 import random
 import re
 import sys
@@ -97,6 +101,70 @@ IL_STRENGTH = {
 }
 IL_ARAB_CLUBS = {"Bnei Sakhnin", "Maccabi Bnei Reineh", "M.S. Kafr Qasim", "Hapoel Nof HaGalil", "Hapoel Umm al-Fahm", "Maccabi Ahi Nazareth"}
 IL_HE_FALLBACK = {"M.S. Kiryat Yam": "מ.ס. קריית ים"}
+# Transfermarkt club name -> our club name
+TM_CLUBS = {
+    "Maccabi Haifa": "Maccabi Haifa", "Maccabi Tel Aviv": "Maccabi Tel Aviv", "Hapoel Beer Sheva": "Hapoel Be'er Sheva",
+    "Hapoel Tel Aviv": "Hapoel Tel Aviv", "Maccabi Netanya": "Maccabi Netanya", "Ihud Bnei Sakhnin": "Bnei Sakhnin",
+    "Ironi Tiberias": "Ironi Tiberias", "Maccabi Bnei Reineh": "Maccabi Bnei Reineh", "FC Ashdod": "Ashdod S.C.",
+    "Beitar Jerusalem": "Beitar Jerusalem", "Bnei Yehuda Tel Aviv": "Bnei Yehuda Tel Aviv", "Hapoel Rishon leZion": "Hapoel Rishon LeZion",
+    "Hapoel Jerusalem": "Hapoel Jerusalem", "Hapoel Haifa": "Hapoel Haifa", "Maccabi Jaffa": "Maccabi Jaffa",
+    "Hapoel Ramat Gan": "Hapoel Ramat Gan", "Ironi Kiryat Shmona": "Ironi Kiryat Shmona", "Maccabi Petah Tikva": "Maccabi Petah Tikva",
+    "SC Kiryat Yam": "M.S. Kiryat Yam", "Hapoel Acre": "Hapoel Acre", "Hapoel Kfar Saba": "Hapoel Kfar Saba",
+    "Hapoel Petah Tikva": "Hapoel Petah Tikva", "Hapoel Nof HaGalil": "Hapoel Nof HaGalil", "Maccabi Herzliya": "Maccabi Herzliya",
+    "Hapoel Hadera": "Hapoel Hadera",
+}
+TM_POS = {
+    "Goalkeeper": "GK", "Centre-Back": "CB", "Left-Back": "LB", "Right-Back": "RB", "Defensive Midfield": "CDM",
+    "Central Midfield": "CM", "Attacking Midfield": "CAM", "Left Midfield": "LM", "Right Midfield": "RM",
+    "Left Winger": "LW", "Right Winger": "RW", "Centre-Forward": "ST", "Second Striker": "ST",
+}
+GROUP_OF = {"GK": "G", "CB": "D", "LB": "D", "RB": "D", "CDM": "M", "CM": "M", "CAM": "M", "LM": "M", "RM": "M", "LW": "A", "RW": "A", "ST": "A"}
+
+
+def value_for(ovr, age):
+    """Same curve as valueFor() in engine.js (without the potential bonus)."""
+    d = ovr - 55
+    v = 300000 * math.exp(0.15 * d + 0.0015 * d * abs(d))
+    v *= 1.3 if age <= 20 else 1.1 if age <= 26 else 0.25 if age >= 34 else 0.45 if age >= 32 else 0.7 if age >= 30 else 1
+    return v
+
+
+def ovr_from_value(value, age, club_base):
+    """Transfermarkt value -> ability. Israeli values run below European ones, hence the +4,
+    and the estimate is blended with the club's level because values are noisy."""
+    if value <= 0:
+        return club_base
+    est = min(range(40, 90), key=lambda o: abs(math.log(value_for(o, age)) - math.log(value)))
+    return int(round(0.5 * (est + 4) + 0.5 * club_base))
+
+
+def load_tm_israel(tm_dir):
+    """Real players at our Israeli clubs: our club name -> list of dicts."""
+    if not tm_dir:
+        return {}
+    base = Path(tm_dir) / "datalake" / "transfermarkt"
+    values = {}
+    for r in csv.DictReader(open(base / "player_latest_market_value" / "player_latest_market_value.csv", encoding="utf-8")):
+        values[r["player_id"]] = float(r["value"] or 0)
+    out = defaultdict(list)
+    for r in csv.DictReader(open(base / "player_profiles" / "player_profiles.csv", encoding="utf-8")):
+        club = TM_CLUBS.get(r["current_club_name"])
+        if not club or not r["date_of_birth"]:
+            continue
+        pos = TM_POS.get(r["position"].split(" - ")[-1].strip()) if r["position"] else None
+        if not pos:
+            continue
+        heb = re.findall(r"[\u0590-\u05FF'\"]+(?:[ -][\u0590-\u05FF'\"]+)*", r["name_in_home_country"] or "")
+        name = max(heb, key=len) if heb else re.sub(r"\s*\(\d+\)$", "", r["player_name"])
+        cits = [c.strip() for c in r["citizenship"].split("  ") if c.strip()]
+        born = r["date_of_birth"]
+        age = SEASON_YEAR - int(born[:4]) - (1 if born[5:] > "09-01" else 0)
+        out[club].append({
+            "name": name, "full": re.sub(r"\s*\(\d+\)$", "", r["player_name"]), "pos": pos, "age": age,
+            "nat": "Israel" if "Israel" in cits or not cits else cits[0], "foot": "L" if r["foot"] == "left" else "R",
+            "value": values.get(r["player_id"], 0), "ctr": int(r["contract_expires"][:4]) if r["contract_expires"] else SEASON_YEAR + 2,
+        })
+    return out
 
 HE_FIRST = ["יונתן", "עומר", "דור", "אליאור", "שון", "רועי", "אופיר", "נועם", "תומר", "איתי", "עידו", "יובל", "ליאור",
             "מתן", "אביב", "גיא", "שחר", "אלון", "רז", "בן", "אור", "סתיו", "אדיר", "מאור", "דניאל", "איתמר", "אליאל",
@@ -143,7 +211,7 @@ def num(v, default=0):
         return default
 
 
-def main(fc_csv, il_repo):
+def main(fc_csv, il_repo, tm_dir=None):
     random.seed(2025)
     rows = list(csv.DictReader(open(fc_csv, encoding="utf-8")))
     by_fc = {lg["fc"]: lg for lg in LEAGUES if "fc" in lg}
@@ -189,6 +257,16 @@ def main(fc_csv, il_repo):
     latin = re.compile(r"^[A-Za-z\u00C0-\u024F' .-]+$")
     foreign_pool = [r for r in rows if r["league_id"] not in by_fc and latin.match(r["long_name"] or "")]
 
+    real_il = load_tm_israel(tm_dir)
+    real_count = 0
+
+    def make_attrs(pos, ovr):
+        if pos == "GK":
+            attrs = [max(30, min(90, ovr + random.randint(-4, 4))) for _ in range(6)]
+            attrs[4] = max(30, ovr - 25 + random.randint(-5, 5))
+            return attrs
+        return [max(25, min(92, ovr + bias + random.randint(-5, 5))) for bias in POS_ATTR[pos]]
+
     for lg_name, league in (("Ligat ha'Al", LEAGUES[10]), ("Liga Leumit", LEAGUES[11])):
         names = [r["club"] for r in seasons if r["season_start"] == str(SEASON_YEAR) and r["league"] == lg_name]
         for name in names:
@@ -199,8 +277,28 @@ def main(fc_csv, il_repo):
             arab_share = 0.7 if name in IL_ARAB_CLUBS else 0.12
             n_foreign = 6 if league["tier"] == 1 else 2
             used_numbers = set()
-            foreign_slots = set(random.sample(range(len(SQUAD_TEMPLATE)), n_foreign))
-            for i, pos in enumerate(SQUAD_TEMPLATE):
+            # real players first; each takes the template slot of its position (or group)
+            template = SQUAD_TEMPLATE[:]
+            reals = sorted(real_il.get(name, []), key=lambda r: -r["value"])
+            for r in reals:
+                slot = r["pos"] if r["pos"] in template else next((t for t in template if GROUP_OF[t] == GROUP_OF[r["pos"]]), None)
+                if slot:
+                    template.remove(slot)
+                ovr = max(50, min(80, ovr_from_value(r["value"], r["age"], base + 1)))
+                pot = max(ovr, min(88, ovr + max(0, 24 - r["age"]) * 2))
+                no = random.choice([n for n in range(2, 40) if n not in used_numbers])
+                used_numbers.add(no)
+                players.append({
+                    "id": len(players) + 1, "n": r["name"], "fn": r["full"], "c": club["id"], "pos": r["pos"], "alt": [],
+                    "age": r["age"], "ovr": ovr, "pot": pot, "at": make_attrs(r["pos"], ovr),
+                    "v": int(round(max(50_000, r["value"] or value_for(ovr, r["age"])), -4)),
+                    "w": int(round(max(1000, (1.14 ** (ovr - 55)) * 1_300), -2)), "nat": r["nat"], "ft": r["foot"],
+                    "no": no, "ctr": max(SEASON_YEAR + 1, r["ctr"]), "real": 1,
+                })
+                real_count += 1
+            n_foreign = max(0, n_foreign - sum(1 for r in reals if r["nat"] != "Israel"))
+            foreign_slots = set(random.sample(range(len(template)), min(n_foreign, len(template))))
+            for i, pos in enumerate(template):
                 age = random.choice(range(18, 35))
                 # foreigners are usually among the better players; every third slot is a backup
                 ovr = int(round(base + random.gauss(0, 2.5) + (2 if i in foreign_slots else 0) - (4 if i % 3 == 2 else 0)))
@@ -218,11 +316,7 @@ def main(fc_csv, il_repo):
                 else:
                     name_str = f"{random.choice(HE_FIRST)} {random.choice(HE_LAST)}"
                     nat, full = "Israel", None
-                if pos == "GK":
-                    attrs = [max(30, min(90, ovr + random.randint(-4, 4))) for _ in range(6)]
-                    attrs[4] = max(30, ovr - 25 + random.randint(-5, 5))
-                else:
-                    attrs = [max(25, min(92, ovr + bias + random.randint(-5, 5))) for bias in POS_ATTR[pos]]
+                attrs = make_attrs(pos, ovr)
                 value = int(round(max(50_000, (1.18 ** (ovr - 55)) * 120_000 * (1.3 if age < 24 else 0.8 if age > 30 else 1)), -4))
                 wage = int(round(max(800, (1.14 ** (ovr - 55)) * 1_200), -2))
                 no = 1 if pos == "GK" and 1 not in used_numbers else random.choice([n for n in range(2, 40) if n not in used_numbers])
@@ -254,7 +348,8 @@ def main(fc_csv, il_repo):
         "players": players,
         "sources": {
             "players": "EA FC 26 dataset via github.com/ismailoksuz/EAFC26-DataHub (2025-09-19)",
-            "israel": "Clubs from github.com/kadishay/israeli-league-charts; Israeli squads are generated",
+            "israel": "Clubs from github.com/kadishay/israeli-league-charts; real players from github.com/salimt/football-datasets "
+                      "(Transfermarkt, Oct 2025); the rest of each Israeli squad is generated",
         },
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -262,13 +357,13 @@ def main(fc_csv, il_repo):
     counts = defaultdict(int)
     for c in clubs:
         counts[c["league"]] += 1
-    print(f"wrote {OUT} - {len(clubs)} clubs, {len(players)} players")
+    print(f"wrote {OUT} - {len(clubs)} clubs, {len(players)} players ({real_count} real Israeli players)")
     for lg in LEAGUES:
         print(f"  {lg['id']}: {counts[lg['id']]} clubs")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         print(__doc__)
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2])
+    main(*sys.argv[1:])

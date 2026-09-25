@@ -376,26 +376,53 @@
   }
 
   // ---------- game shell ----------
-  const MANAGER_TABS = [['home', 'בית'], ['squad', 'סגל'], ['tactics', 'טקטיקה'], ['league', 'ליגות'], ['transfers', 'העברות'], ['inbox', 'דואר'], ['club', 'מועדון'], ['menu', 'תפריט']];
+  const MANAGER_TABS = [['home', 'בית'], ['squad', 'סגל'], ['tactics', 'טקטיקה'], ['training', 'אימונים'], ['league', 'ליגות'], ['transfers', 'העברות'], ['inbox', 'דואר'], ['club', 'מועדון'], ['menu', 'תפריט']];
   const PRO_TABS = [['home', 'הקריירה שלי'], ['training', 'אימון'], ['team', 'הקבוצה'], ['league', 'ליגות'], ['inbox', 'דואר'], ['history', 'היסטוריה'], ['menu', 'תפריט']];
+
+  function lightness(hex) {
+    const n = parseInt(String(hex).slice(1, 7), 16);
+    return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
+  }
+  // The club's most usable colour on a dark background (white kits fall back to the secondary colour).
+  function clubColor(club) {
+    const [a, b] = club.colors;
+    if (lightness(a) > 225 && b && lightness(b) < 225) return b;
+    return a;
+  }
+  function applyClubTheme(club) {
+    const root = document.documentElement.style;
+    root.setProperty('--c1', clubColor(club));
+    root.setProperty('--c2', club.colors[1] && club.colors[1] !== clubColor(club) ? club.colors[1] : '#0b5d34');
+  }
+  function alpha(hex, a) {
+    return `${String(hex).slice(0, 7)}${Math.round(a * 255).toString(16).padStart(2, '0')}`;
+  }
 
   function gameScreen() {
     const club = S.clubs[userClubId()];
+    applyClubTheme(club);
     const date = E.weekDate(S, S.week);
     const unread = S.inbox.filter((m) => !m.read).length;
     const fx = E.clubFixture(S, club.id, S.week);
-    const contLabel = S.week > E.SEASON_WEEKS ? 'סיום עונה' : fx && fx.m.hg === null ? '⚽ למשחק' : 'המשך ▸';
+    const contLabel = S.pendingMonth ? '📅 סיכום חודשי' : fx && fx.m.hg === null ? '⚽ למשחק' : 'המשך ▸';
     const info = S.mode === 'manager'
-      ? h('div', { class: 'meta' }, `${dateFmt.format(date)} · שבוע ${S.week}/${E.SEASON_WEEKS} · יתרה `, h('span', { class: 'num ' + (club.balance < 0 ? 'bad' : ''), text: money(club.balance) }))
-      : h('div', { class: 'meta' }, `${dateFmt.format(date)} · ${S.players[S.pro.pid].n} `, ovrBadge(S.players[S.pro.pid].ovr));
+      ? h('div', { class: 'row', style: { gap: '6px' } },
+        h('span', { class: 'chip', text: `📅 ${dateFmt.format(date)}` }),
+        h('span', { class: 'chip' }, '💰 ', h('span', { class: 'num ' + (club.balance < 0 ? 'bad' : ''), text: money(club.balance) })),
+        h('span', { class: 'chip', text: E.windowOpen(S) ? '🟢 חלון העברות' : '🔴 חלון סגור' }))
+      : h('div', { class: 'row', style: { gap: '6px' } },
+        h('span', { class: 'chip', text: `📅 ${dateFmt.format(date)}` }),
+        h('span', { class: 'chip' }, `${S.players[S.pro.pid].n} `, ovrBadge(S.players[S.pro.pid].ovr)));
     const tabs = S.mode === 'manager' ? MANAGER_TABS : PRO_TABS;
     const main = h('main');
     app.replaceChildren(
       h('div', { class: 'topbar' },
         h('div', { class: 'topbar-inner' },
-          h('div', { class: 'club' }, crest(club, true), h('div', null, h('div', { text: club.name }), h('div', { class: 'meta', text: `${leagueName(club.league)} · ${E.windowOpen(S) ? 'חלון העברות פתוח' : 'חלון העברות סגור'}` }))),
+          h('div', { class: 'club' }, crest(club, true), h('div', null, h('div', { text: club.name }), h('div', { class: 'meta', text: leagueName(club.league) }))),
           info,
-          h('button', { class: 'primary continue', text: contLabel, disabled: busy, onclick: onContinue })),
+          h('div', { class: 'continue-wrap' },
+            h('button', { class: 'small', title: 'מדלג על כל המשחקים עד תחילת החודש הבא', text: '⏩ לחודש הבא', disabled: busy || !!S.pendingMonth, onclick: simToNextMonth }),
+            h('button', { class: 'primary continue', text: contLabel, disabled: busy, onclick: onContinue }))),
         h('div', { class: 'nav' }, tabs.map(([id, label]) => h('button', { class: tab === id ? 'active' : '', onclick: () => { tab = id; gameScreen(); } },
           label, id === 'inbox' && unread ? h('span', { class: 'count', text: String(unread) }) : null)))),
       main);
@@ -406,6 +433,7 @@
     };
     (views[tab] || views.home)(main);
     window.scrollTo(0, 0);
+    if (S.pendingMonth && !monthModalOpen && !busy && !suppressMonth) monthReviewModal();
   }
 
   // ---------- manager home ----------
@@ -443,40 +471,78 @@
       h('td', { class: 'c num', text: String(r.p) }), h('td', { class: 'c num', text: `${r.gd > 0 ? '+' : ''}${r.gd}` }), h('td', { class: 'c' }, h('b', { text: String(r.pts) }))))));
   }
 
+  function kpi(ico, label, value, sub, extra) {
+    return h('div', { class: 'card kpi' }, extra || h('div', { class: 'ico', text: ico }),
+      h('div', null, h('div', { class: 'lbl', text: label }), h('div', { class: 'val' }, value), sub ? h('div', { class: 'sub', text: sub }) : null));
+  }
+  function ring(pct, color) {
+    const r = h('div', { class: 'ring' }, h('span', { class: 'num', text: String(Math.round(pct)) }));
+    r.style.setProperty('--p', String(pct));
+    r.style.setProperty('--col', color || (pct >= 60 ? 'var(--accent)' : pct >= 35 ? 'var(--accent2)' : 'var(--danger)'));
+    return r;
+  }
+  function heroMatch(clubId, next) {
+    if (!next) return h('div', { class: 'card' }, h('h3', { text: 'המשחק הבא' }), h('p', { class: 'muted', text: 'אין משחקים נוספים העונה.' }));
+    const home = S.clubs[next.m.h];
+    const away = S.clubs[next.m.a];
+    const side = (c) => {
+      const el = h('div', { class: 'side' }, crest(c, true), h('div', { class: 'nm', text: c.name }),
+        h('div', { class: 'sub', text: `מקום ${positionOf(c.id)}` }), formDots(c.form.slice(-5)));
+      el.style.background = `linear-gradient(160deg, ${alpha(clubColor(c), 0.55)}, ${alpha(clubColor(c), 0.08)})`;
+      el.querySelector('.badge').classList.add('huge');
+      return el;
+    };
+    return h('div', { class: 'card hero-match' },
+      h('span', { class: 'hero-label chip', text: next.m.h === clubId ? '🏟 משחק בית' : '✈ משחק חוץ' }),
+      side(home),
+      h('div', { class: 'mid' }, h('div', { class: 'vs', text: 'VS' }), h('div', { class: 'when', text: dateFmt.format(E.weekDate(S, next.week)) }),
+        S.mode === 'manager' ? h('button', { class: 'small', text: 'טקטיקה', onclick: () => { tab = 'tactics'; gameScreen(); } }) : null),
+      side(away));
+  }
+  function monthCalendar(clubId) {
+    const key = E.monthKeyOf(S, S.week);
+    const games = E.clubSchedule(S, clubId).filter((f) => E.monthKeyOf(S, f.week) === key);
+    const next = games.find((f) => f.m.hg === null);
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h3', { text: `החודש · ${E.monthLabel(key)}` }), h('span', { class: 'muted', text: `${games.length} משחקים` })),
+      games.length ? h('div', { class: 'calendar' }, games.map((f) => {
+        const home = f.m.h === clubId;
+        const opp = S.clubs[home ? f.m.a : f.m.h];
+        let res = h('span', { class: 'muted', text: f === next ? 'הבא' : '—' });
+        if (f.m.hg !== null) {
+          const gf = home ? f.m.hg : f.m.ag;
+          const ga = home ? f.m.ag : f.m.hg;
+          res = h('span', { class: `res num ${gf > ga ? 'W' : gf < ga ? 'L' : 'D'}`, text: `${gf}-${ga}` });
+        }
+        return h('div', { class: 'cal-cell' + (f === next ? ' now' : ''), title: opp.name },
+          h('span', { class: 'muted', text: shortDate.format(E.weekDate(S, f.week)) }), crest(opp, true), h('span', { text: home ? 'בית' : 'חוץ' }), res);
+      })) : h('p', { class: 'muted', text: 'אין משחקים החודש.' }));
+  }
+
   function homeManager(main) {
     const club = S.clubs[S.user.clubId];
+    const table = E.sortedTable(S, club.league);
     const pos = positionOf(club.id);
+    const row = S.tables[club.league][club.id];
     const next = nextFixtures(club.id, 1)[0];
-    let nextCard;
-    if (next) {
-      const home = next.m.h === club.id;
-      const opp = S.clubs[home ? next.m.a : next.m.h];
-      nextCard = h('div', { class: 'card' }, h('h3', { text: 'המשחק הבא' }),
-        h('div', { class: 'row', style: { justifyContent: 'center', gap: '18px', margin: '10px 0' } },
-          crest(home ? club : opp, true), h('b', { class: 'num', text: 'VS' }), crest(home ? opp : club, true)),
-        h('p', { style: { textAlign: 'center' } }, h('b', { text: `${(home ? club : opp).name} - ${(home ? opp : club).name}` })),
-        h('p', { class: 'muted', style: { textAlign: 'center' }, text: `${dateFmt.format(E.weekDate(S, next.week))} · היריבה במקום ${positionOf(opp.id)}` }),
-        h('div', { style: { textAlign: 'center' } }, formDots(opp.form)),
-        h('div', { class: 'row', style: { justifyContent: 'center', marginTop: '10px' } }, h('button', { text: 'לטקטיקה', onclick: () => { tab = 'tactics'; gameScreen(); } })));
-    } else {
-      nextCard = h('div', { class: 'card' }, h('h3', { text: 'המשחק הבא' }), h('p', { class: 'muted', text: 'אין משחקים נוספים העונה.' }));
-    }
     const wages = E.squad(S, club.id).reduce((s, p) => s + p.w, 0);
-    main.append(h('div', { class: 'grid two' },
-      nextCard,
-      h('div', { class: 'card' }, h('div', { class: 'row spread' }, h('h3', { text: leagueName(club.league) }), h('button', { class: 'small', text: 'טבלה מלאה', onclick: () => { tab = 'league'; gameScreen(); } })), miniTable(club.id)),
-      h('div', { class: 'card' }, h('h3', { text: 'הנהלה וכספים' }),
-        h('dl', { class: 'kv' },
-          h('dt', { text: 'ציפייה' }), h('dd', { text: `מקום ${S.user.expected}` }),
-          h('dt', { text: 'מקום נוכחי' }), h('dd', null, h('b', { class: pos <= S.user.expected ? 'good' : pos > S.user.expected + 4 ? 'bad' : 'warn', text: String(pos) })),
-          h('dt', { text: 'יתרה' }), h('dd', { class: 'num', text: money(club.balance) }),
-          h('dt', { text: 'הכנסה שבועית' }), h('dd', { class: 'num good', text: money(club.income) }),
-          h('dt', { text: 'שכר שבועי' }), h('dd', { class: 'num ' + (wages > club.income ? 'bad' : ''), text: money(wages) }))),
-      h('div', { class: 'card' }, h('h3', { text: 'תוצאות אחרונות' }), h('table', null, h('tbody', null, lastResults(club.id, 5).map((f) => fixtureRow(f, club.id)))),
-        lastResults(club.id, 1).length ? null : h('p', { class: 'muted', text: 'העונה עוד לא התחילה.' })),
-      h('div', { class: 'card' }, h('h3', { text: 'משחקים קרובים' }), h('table', null, h('tbody', null, nextFixtures(club.id, 5).map((f) => fixtureRow(f, club.id))))),
-      h('div', { class: 'card' }, h('h3', { text: 'חדשות העברות' }),
-        S.news.length ? S.news.slice(0, 7).map((n) => h('p', { style: { margin: '6px 0' }, text: `• ${n.text}` })) : h('p', { class: 'muted', text: 'אין חדשות עדיין.' }))));
+    const conf = S.user.confidence === undefined ? 60 : S.user.confidence;
+    const tr = E.trainingOf(club);
+    main.append(
+      h('div', { class: 'kpis' },
+        kpi('🏆', 'מקום בליגה', h('span', null, h('span', { class: row.p === 0 ? '' : pos <= S.user.expected ? 'good' : pos > S.user.expected + 4 ? 'bad' : 'warn', text: String(pos) }), h('span', { class: 'muted', style: { fontSize: '14px' }, text: ` / ${table.length}` })), `ציפייה: מקום ${S.user.expected}`),
+        kpi('📊', 'נקודות', String(row.pts), `${row.w} נ' · ${row.d} ת' · ${row.l} ה'`),
+        kpi('', 'אמון ההנהלה', `${conf}%`, conf >= 60 ? 'יציב' : conf >= 35 ? 'בלחץ' : 'בסכנת פיטורים', ring(conf)),
+        kpi('💰', 'מאזן שבועי', h('span', { class: 'num ' + (club.income - wages < 0 ? 'bad' : 'good'), text: money(club.income - wages) }), `יתרה ${money(club.balance)}`),
+        kpi('🏋', 'אימון החודש', E.TRAINING_FOCUS[tr.focus].label, `עצימות ${E.TRAINING_INTENSITY[tr.intensity].label}`)),
+      h('div', { class: 'grid two' },
+        heroMatch(club.id, next),
+        h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h3', { text: leagueName(club.league) }), h('button', { class: 'small', text: 'טבלה מלאה', onclick: () => { tab = 'league'; gameScreen(); } })), miniTable(club.id)),
+        h('div', { class: 'span-all' }, monthCalendar(club.id)),
+        h('div', { class: 'card' }, h('h3', { text: 'תוצאות אחרונות' }), h('table', null, h('tbody', null, lastResults(club.id, 5).map((f) => fixtureRow(f, club.id)))),
+          lastResults(club.id, 1).length ? null : h('p', { class: 'muted', text: 'העונה עוד לא התחילה.' })),
+        h('div', { class: 'card' }, h('h3', { text: 'חדשות העברות' }),
+          S.news.length ? S.news.slice(0, 7).map((n) => h('p', { style: { margin: '6px 0' }, text: `• ${n.text}` })) : h('p', { class: 'muted', text: 'אין חדשות עדיין.' }))));
   }
 
   // ---------- squad ----------
@@ -581,7 +647,8 @@
           h('dt', { text: 'כושר / מורל' }), h('dd', { text: `${Math.round(p.cond)}% / ${Math.round(p.morale)}` }),
           p.inj > 0 ? [h('dt', { text: 'פציעה' }), h('dd', { class: 'bad', text: `${p.inj} שבועות` })] : null,
           h('dt', { text: 'העונה' }), h('dd', { text: `${p.st.app} הופעות · ${p.st.gl} שערים · ${p.st.as} בישולים · ציון ${p.st.app ? E.avgRating(p).toFixed(2) : '-'}` }),
-          p.gen ? [h('dt', { text: 'מקור' }), h('dd', { class: 'muted', text: 'שחקן שנוצר במשחק' })] : null)),
+          p.gen ? [h('dt', { text: 'מקור' }), h('dd', { class: 'muted', text: 'שחקן שנוצר במשחק' })] : null,
+          p.real ? [h('dt', { text: 'מקור' }), h('dd', null, h('span', { class: 'tag real', text: 'שחקן אמיתי · Transfermarkt' }))] : null)),
       h('div', null, h('h3', { text: 'תכונות' }), attrBars(p)));
   }
 
@@ -849,45 +916,72 @@
     const role = E.proSquadRole(S);
     const next = nextFixtures(club.id, 1)[0];
     const recent = pro.lastRatings.slice(-8);
-    const roleText = { start: '🟢 צפוי לפתוח בהרכב', bench: '🟡 צפוי לשבת על הספסל', out: '🔴 לא צפוי להיכלל בסגל' }[role];
-    main.append(h('div', { class: 'grid two' },
-      h('div', { class: 'card' },
-        h('div', { class: 'row' }, ovrBadge(p.ovr, true), h('div', null,
-          h('h2', { style: { margin: 0 }, text: p.n }),
-          h('div', { class: 'muted', text: `${E.POS_HE[p.pos]} · גיל ${p.age} · ${natName(p.nat)}` }),
-          h('div', { style: { marginTop: '4px' } }, clubLabel(club)))),
-        h('dl', { class: 'kv', style: { marginTop: '14px' } },
-          h('dt', { text: 'מעמד בקבוצה' }), h('dd', { text: roleText }),
-          h('dt', { text: 'רמת הקבוצה' }), h('dd', null, ovrBadge(club.rep)),
-          h('dt', { text: 'שווי' }), h('dd', { class: 'num', text: money(p.v) }),
-          h('dt', { text: 'שכר' }), h('dd', { class: 'num', text: `${money(p.w)} לשבוע` }),
-          h('dt', { text: 'הופעות בנבחרת' }), h('dd', { text: String(pro.caps) }),
-          h('dt', { text: 'מוניטין' }), h('dd', { text: '★'.repeat(Math.min(5, 1 + Math.floor(pro.fame / 20))) })),
-        h('p', { class: 'muted', text: role === 'start' ? '' : 'שחק טוב והשתפר באימונים כדי לזכות במקום בהרכב.' })),
-      h('div', { class: 'card' }, h('h3', { text: 'תכונות' }), attrBars(p, pro.xp),
-        h('p', { class: 'muted', text: 'הפס הצהוב מתחת לכל תכונה מראה את ההתקדמות לנקודה הבאה.' })),
-      h('div', { class: 'card' }, h('h3', { text: 'המשחק הבא' }),
-        next ? h('p', null, clubLabel(S.clubs[next.m.h === club.id ? next.m.a : next.m.h]), ` · ${next.m.h === club.id ? 'בית' : 'חוץ'} · ${dateFmt.format(E.weekDate(S, next.week))}`) : h('p', { class: 'muted', text: 'אין משחקים נוספים העונה.' }),
-        h('h3', { style: { marginTop: '14px' }, text: 'ציונים אחרונים' }),
-        recent.length ? h('div', { class: 'spark' }, recent.map((r) => h('i', { title: String(r), style: { height: `${Math.max(8, (r - 4) * 16)}%`, background: ovrColor(r * 10 + 10) } }))) : h('p', { class: 'muted', text: 'עדיין לא שיחקת.' })),
-      h('div', { class: 'card' }, h('h3', { text: `העונה (${E.seasonLabel(S.seasonYear)})` }),
-        h('div', { class: 'row', style: { justifyContent: 'space-around', textAlign: 'center' } },
-          [['הופעות', p.st.app], ['שערים', p.st.gl], ['בישולים', p.st.as], ['ציון ממוצע', p.st.app ? E.avgRating(p).toFixed(2) : '-']].map(([l, v]) => h('div', null, h('div', { class: 'big-stat', text: String(v) }), h('div', { class: 'muted', text: l })))),
-        h('h3', { style: { marginTop: '14px' }, text: leagueName(club.league) }), miniTable(club.id))));
+    const trust = pro.trust === undefined ? 50 : pro.trust;
+    const roleText = { start: '🟢 בהרכב', bench: '🟡 ספסל', out: '🔴 מחוץ לסגל' }[role];
+    main.append(
+      h('div', { class: 'kpis' },
+        kpi('', 'דירוג כללי', String(p.ovr), `${E.POS_HE[p.pos]} · גיל ${p.age}`, ovrBadge(p.ovr, false)),
+        kpi('👕', 'מעמד בקבוצה', roleText, `רמת הקבוצה ${club.rep}`),
+        kpi('', 'אמון המאמן', `${Math.round(trust)}%`, 'משפיע על הבחירה להרכב', ring(trust)),
+        kpi('💶', 'חשבון בנק', h('span', { class: 'num', text: money(pro.money || 0) }), `שכר ${money(p.w)} לשבוע`),
+        kpi('⭐', 'מוניטין', '★'.repeat(Math.min(5, 1 + Math.floor(pro.fame / 20))), `${pro.caps} הופעות בנבחרת${pro.awards ? ` · ${pro.awards} פרסי שחקן החודש` : ''}`)),
+      h('div', { class: 'grid two' },
+        heroMatch(club.id, next),
+        h('div', { class: 'card' },
+          h('div', { class: 'row' }, ovrBadge(p.ovr, true), h('div', null,
+            h('h2', { style: { margin: 0 }, text: p.n }),
+            h('div', { class: 'muted', text: `${E.POS_HE[p.pos]} · גיל ${p.age} · ${natName(p.nat)}` }),
+            h('div', { style: { marginTop: '4px' } }, clubLabel(club)))),
+          h('div', { style: { marginTop: '10px' } }, attrBars(p, pro.xp)),
+          h('p', { class: 'muted', style: { fontSize: '12px' }, text: 'הפס הצהוב מראה התקדמות לנקודה הבאה בכל תכונה.' })),
+        h('div', { class: 'span-all' }, monthCalendar(club.id)),
+        h('div', { class: 'card' }, h('h3', { text: `העונה (${E.seasonLabel(S.seasonYear)})` }),
+          h('div', { class: 'stat-tiles' },
+            [['הופעות', p.st.app], ['שערים', p.st.gl], ['בישולים', p.st.as], ['ציון', p.st.app ? E.avgRating(p).toFixed(2) : '-']].map(([l, v]) => h('div', { class: 'stat-tile' }, h('b', { text: String(v) }), h('span', { text: l })))),
+          h('h3', { style: { marginTop: '16px' }, text: 'ציונים אחרונים' }),
+          recent.length ? h('div', { class: 'spark' }, recent.map((r) => h('i', { title: String(r), style: { height: `${Math.max(8, (r - 4) * 16)}%`, background: ovrColor(r * 10 + 10) } }))) : h('p', { class: 'muted', text: 'עדיין לא שיחקת.' })),
+        h('div', { class: 'card' }, h('h3', { text: leagueName(club.league) }), miniTable(club.id))));
   }
 
   function trainingView(main) {
+    if (S.mode === 'manager') {
+      const club = S.clubs[S.user.clubId];
+      const tr = E.trainingOf(club);
+      const sq = E.squad(S, club.id);
+      const avgCond = Math.round(sq.reduce((s, p) => s + p.cond, 0) / sq.length);
+      main.append(
+        h('div', { class: 'kpis' },
+          kpi('💪', 'כושר ממוצע', `${avgCond}%`, 'משתקם בין המשחקים'),
+          kpi('✚', 'פצועים', String(sq.filter((p) => p.inj > 0).length), 'אימון אינטנסיבי מגדיל סיכון'),
+          kpi('🌱', 'צעירים (עד 23)', String(sq.filter((p) => p.age <= 23).length), 'מתפתחים מהר יותר'),
+          kpi('🙂', 'מורל ממוצע', String(Math.round(sq.reduce((s, p) => s + p.morale, 0) / sq.length)), '')),
+        h('div', { class: 'card' }, h('h3', { text: 'מוקד האימון' }),
+          h('p', { class: 'muted', text: 'המוקד משפיע על ביצועי הקבוצה במשחקים ועל התכונות שמשתפרות. השחקנים מתפתחים בכל תחילת חודש.' }),
+          h('div', { class: 'choices' }, Object.entries(E.TRAINING_FOCUS).map(([k, f]) => h('button', {
+            class: 'choice' + (tr.focus === k ? ' selected' : ''), onclick: () => { E.setTraining(S, k, tr.intensity); gameScreen(); },
+          }, h('b', { text: f.label }), h('small', { text: f.desc }))))),
+        h('div', { class: 'card', style: { marginTop: '16px' } }, h('h3', { text: 'עצימות' }),
+          h('div', { class: 'choices' }, Object.entries(E.TRAINING_INTENSITY).map(([k, it]) => h('button', {
+            class: 'choice' + (tr.intensity === k ? ' selected' : ''), onclick: () => { E.setTraining(S, tr.focus, k); gameScreen(); },
+          }, h('b', { text: it.label }), h('small', { text: `התפתחות ×${it.dev} · התאוששות ${it.recovery}% בשבוע · סיכון פציעה ${(it.injury * 100).toFixed(2)}% לשחקן בשבוע` }))))));
+      return;
+    }
     const pro = S.pro;
     const p = S.players[pro.pid];
     const labels = p.pos === 'GK' ? E.GK_ATTR_HE : E.ATTR_HE;
-    main.append(h('div', { class: 'card' }, h('h3', { text: 'מוקד אימון שבועי' }),
-      h('p', { class: 'muted', text: 'בכל שבוע אתה מקבל נקודות ניסיון בתכונה שבחרת. גם ההחלטות במשחקים מפתחות את התכונות שבהן השתמשת. שחקנים צעירים משתפרים מהר יותר.' }),
-      h('div', { class: 'grid three' }, labels.map((l, i) => h('button', {
-        class: pro.focus === i ? 'primary' : '', style: { padding: '16px' },
-        onclick: () => { pro.focus = i; gameScreen(); },
-      }, h('div', { class: 'big-stat', text: String(p.at[i]) }), h('div', { text: l }),
-      h('div', { class: 'bar xp', style: { marginTop: '6px' } }, h('i', { style: { width: `${Math.min(100, pro.xp[i])}%` } }))))),
-      h('p', { class: 'muted', text: `הדירוג הכללי מחושב לפי העמדה שלך (${E.POS_HE[p.pos]}). התכונות החשובות לעמדה משפיעות עליו יותר.` })));
+    const intensity = pro.intensity || 'normal';
+    main.append(
+      h('div', { class: 'card' }, h('h3', { text: 'מוקד אימון' }),
+        h('p', { class: 'muted', text: 'בכל שבוע אתה צובר ניסיון בתכונה שבחרת. גם ההחלטות במשחקים מפתחות את התכונות שבהן השתמשת, ושחקנים צעירים משתפרים מהר יותר.' }),
+        h('div', { class: 'choices' }, labels.map((l, i) => h('button', {
+          class: 'choice' + (pro.focus === i ? ' selected' : ''), onclick: () => { E.setTraining(S, i, intensity); gameScreen(); },
+        }, h('div', { class: 'big-stat', text: String(p.at[i]) }), h('b', { text: l }),
+        h('div', { class: 'bar xp', style: { marginTop: '6px' } }, h('i', { style: { width: `${Math.min(100, pro.xp[i])}%`, background: 'var(--accent2)' } })))))),
+      h('div', { class: 'card', style: { marginTop: '16px' } }, h('h3', { text: 'עצימות' }),
+        h('div', { class: 'choices' }, Object.entries(E.TRAINING_INTENSITY).map(([k, it]) => h('button', {
+          class: 'choice' + (intensity === k ? ' selected' : ''), onclick: () => { E.setTraining(S, pro.focus, k); gameScreen(); },
+        }, h('b', { text: it.label }), h('small', { text: `ניסיון ×${it.dev} · סיכון פציעה ${(it.injury * 150).toFixed(2)}% בשבוע` }))))),
+      h('p', { class: 'muted', text: `הדירוג הכללי מחושב לפי העמדה שלך (${E.POS_HE[p.pos]}), כך שהתכונות החשובות לעמדה משפיעות עליו יותר.` }));
   }
 
   function historyView(main) {
@@ -906,6 +1000,7 @@
   // ---------- advancing time ----------
   async function onContinue() {
     if (busy) return;
+    if (S.pendingMonth) return monthReviewModal();
     const clubId = userClubId();
     const fx = E.clubFixture(S, clubId, S.week);
     if (fx && fx.m.hg === null) {
@@ -922,13 +1017,13 @@
     gameScreen();
     setTimeout(() => finishWeek(null), 20);
   }
-  function managerSim(fx) {
+  function managerSim(fx, quick) {
     const userSide = fx.m.h === S.user.clubId ? 0 : 1;
-    return new E.MatchSim(S, fx.m.h, fx.m.a, { detail: true, userSide });
+    return new E.MatchSim(S, fx.m.h, fx.m.a, { detail: !quick, userSide });
   }
 
-  function finishWeek(sim) {
-    busy = true;
+  // Plays the rest of the week around `sim` (the user's match, or null).
+  function advanceWeek(sim) {
     const results = E.playWeek(S, sim);
     let proReport = null;
     if (sim && S.mode === 'pro') {
@@ -936,14 +1031,151 @@
       if (r) proReport = E.proAfterMatch(S, sim, r.ratings);
     }
     const summary = E.afterWeek(S);
+    return { summary, proReport };
+  }
+
+  let suppressMonth = false;
+  function finishWeek(sim) {
+    busy = true;
+    const { summary, proReport } = advanceWeek(sim);
     busy = false;
     saveGame(true);
+    const report = proReport && proReport.played;
+    suppressMonth = !!report; // show the match report first, then the monthly review
     gameScreen();
-    if (proReport && proReport.played) proReportModal(proReport);
+    if (report) {
+      proReportModal(proReport, () => {
+        suppressMonth = false;
+        if (S.pendingMonth) monthReviewModal();
+      });
+    }
     if (summary) seasonEndModal(summary);
   }
 
-  function proReportModal(r) {
+  // Simulates week after week (the user's matches too) until a new month starts.
+  function simToNextMonth() {
+    if (busy || S.pendingMonth) return;
+    busy = true;
+    gameScreen();
+    toast('מדלג לחודש הבא...');
+    let weeks = 0;
+    let summary = null;
+    const results = [];
+    const step = () => {
+      const clubId = userClubId();
+      const fx = E.clubFixture(S, clubId, S.week);
+      let sim = null;
+      if (fx && fx.m.hg === null) {
+        sim = S.mode === 'manager' ? managerSim(fx, true) : E.proMatchSim(S, fx);
+        sim.runToEnd();
+        const [H, A] = sim.sides;
+        results.push(`${H.club.name} ${H.goals} - ${A.goals} ${A.club.name}`);
+      }
+      const r = advanceWeek(sim);
+      summary = r.summary;
+      weeks++;
+      if (!summary && !S.pendingMonth && weeks < 8) return setTimeout(step, 0);
+      busy = false;
+      saveGame(true);
+      gameScreen();
+      if (results.length) toast(`שוחקו ${results.length} משחקים. אחרון: ${results[results.length - 1]}`, 4000);
+      if (summary) seasonEndModal(summary);
+    };
+    setTimeout(step, 20);
+  }
+
+  let monthModalOpen = false;
+  function monthReviewModal() {
+    const r = S.pendingMonth;
+    if (!r || monthModalOpen) return;
+    monthModalOpen = true;
+    openModal((close) => {
+      const body = h('div');
+      const render = () => {
+        const allAnswered = r.decisions.every((d) => d.answer !== null);
+        const parts = [
+          h('div', { class: 'modal-head' }, h('div', null, h('div', { class: 'muted', text: 'סיכום חודשי' }), h('h2', { class: 'month-title', text: r.label })), h('span', { style: { fontSize: '40px' }, text: '📅' })),
+        ];
+        if (r.club) {
+          const c = r.club;
+          const tiles = S.mode === 'manager'
+            ? [['משחקים', c.p], ['נצחונות', c.w], ['תיקו', c.d], ['הפסדים', c.l], ['שערים', `${c.gf}:${c.ga}`], ['מקום', `${c.posFrom}→${c.posTo}`], ['מאזן', money(c.balanceDelta)]]
+            : [['הופעות', r.pro.app], ['שערים', r.pro.gl], ['בישולים', r.pro.as], ['ציון', r.pro.rating ? r.pro.rating.toFixed(2) : '-'], ['דירוג', `${r.pro.ovrFrom}→${r.pro.ovrTo}`], ['הקבוצה', `${c.w}-${c.d}-${c.l}`]];
+          parts.push(h('div', { class: 'stat-tiles' }, tiles.map(([l, v]) => h('div', { class: 'stat-tile' }, h('b', { class: 'num', text: String(v) }), h('span', { text: l })))));
+        }
+        const awards = [];
+        if (r.userMotm) awards.push(h('div', { class: 'award' }, h('span', { class: 'ico', text: '🏅' }), h('div', null, h('b', { text: 'מאמן החודש!' }), h('div', { class: 'muted', text: 'הקבוצה שלך צברה הכי הרבה נקודות בליגה החודש.' }))));
+        if (r.pro && r.pro.award) awards.push(h('div', { class: 'award' }, h('span', { class: 'ico', text: '🏅' }), h('div', null, h('b', { text: 'שחקן החודש בליגה!' }), h('div', { class: 'muted', text: 'המוניטין שלך עלה.' }))));
+        const potmRow = (label, x) => x && h('div', { class: 'row', style: { margin: '6px 0' } }, h('span', { class: 'muted', text: label }), crest(S.clubs[x.club]), h('b', { text: x.name }),
+          h('span', { class: 'muted', text: `ציון ${x.rating.toFixed(2)} · ${x.gl} שערים · ${x.as} בישולים` }));
+        const potms = [potmRow('שחקן החודש בקבוצה:', r.clubPotm), potmRow('שחקן החודש בליגה:', r.leaguePotm),
+          r.motm ? h('div', { class: 'row', style: { margin: '6px 0' } }, h('span', { class: 'muted', text: 'מאמן החודש:' }), clubLabel(S.clubs[r.motm.clubId]), h('span', { class: 'muted', text: `${r.motm.pts} נק' מ-${r.motm.p} משחקים` })) : null].filter(Boolean);
+        parts.push(h('div', { class: 'grid two', style: { marginTop: '14px' } },
+          h('div', { class: 'card tight' }, h('h3', { text: 'פרסים' }), awards, potms.length ? potms : h('p', { class: 'muted', text: 'לא היו מספיק משחקים החודש.' })),
+          r.confidence ? h('div', { class: 'card tight' }, h('h3', { text: 'אמון ההנהלה' }),
+            h('div', { class: 'row' }, ring(r.confidence.to), h('div', null, h('b', { class: r.confidence.to >= r.confidence.from ? 'good' : 'bad', text: `${r.confidence.from}% ← ${r.confidence.to}%` }),
+              r.confidence.reasons.map((x) => h('div', { class: 'muted', style: { fontSize: '13px' }, text: `• ${x}` })))),
+            r.fired ? h('p', { class: 'bad', text: 'ההנהלה איבדה את האמון בך...' }) : null)
+            : r.pro ? h('div', { class: 'card tight' }, h('h3', { text: 'מצב' }), h('div', { class: 'row' }, ring(S.pro.trust === undefined ? 50 : S.pro.trust), h('div', null, h('b', { text: 'אמון המאמן' }), h('div', { class: 'muted', text: `מוניטין ${r.pro.fame >= 0 ? '+' : ''}${r.pro.fame} החודש` })))) : null));
+        if (r.news.length) parts.push(h('div', { style: { marginTop: '10px' } }, r.news.map((n) => h('p', { class: 'warn', text: `⚠ ${n}` }))));
+        if (r.decisions.length) {
+          parts.push(h('h3', { style: { marginTop: '18px' }, text: 'החלטות החודש' }));
+          r.decisions.forEach((d, i) => {
+            parts.push(h('div', { class: 'decision-card' + (d.answer !== null ? ' done' : '') },
+              h('h4', { text: d.title }), h('div', { class: 'muted', text: d.body }),
+              d.answer === null
+                ? h('div', { class: 'opts' }, d.options.map((o, k) => h('button', { onclick: () => { E.answerDecision(S, i, k); render(); } }, h('b', { text: o.label }), o.hint ? h('small', { text: o.hint }) : null)))
+                : h('div', { class: 'result' }, h('b', { text: `${d.options[d.answer].label}: ` }), d.result)));
+          });
+        }
+        if (!r.fired) {
+          parts.push(h('h3', { style: { marginTop: '18px' }, text: S.mode === 'manager' ? 'תוכנית אימונים לחודש הבא' : 'עצימות אימון לחודש הבא' }));
+          if (S.mode === 'manager') {
+            const tr = E.trainingOf(S.clubs[S.user.clubId]);
+            parts.push(h('div', { class: 'choices' }, Object.entries(E.TRAINING_FOCUS).map(([k, f]) => h('button', {
+              class: 'choice' + (tr.focus === k ? ' selected' : ''), onclick: () => { E.setTraining(S, k, tr.intensity); render(); },
+            }, h('b', { text: f.label }), h('small', { text: f.desc })))));
+            parts.push(h('div', { class: 'choices', style: { marginTop: '8px' } }, Object.entries(E.TRAINING_INTENSITY).map(([k, it]) => h('button', {
+              class: 'choice' + (tr.intensity === k ? ' selected' : ''), onclick: () => { E.setTraining(S, tr.focus, k); render(); },
+            }, h('b', { text: `עצימות: ${it.label}` })))));
+          } else {
+            const cur = S.pro.intensity || 'normal';
+            parts.push(h('div', { class: 'choices' }, Object.entries(E.TRAINING_INTENSITY).map(([k, it]) => h('button', {
+              class: 'choice' + (cur === k ? ' selected' : ''), onclick: () => { E.setTraining(S, S.pro.focus, k); render(); },
+            }, h('b', { text: it.label }), h('small', { text: `ניסיון ×${it.dev}` })))));
+          }
+        }
+        parts.push(h('div', { class: 'row', style: { marginTop: '18px', justifyContent: 'flex-end' } },
+          allAnswered ? null : h('span', { class: 'muted', text: 'ענה על כל ההחלטות כדי להמשיך' }),
+          h('button', { class: 'primary', disabled: !allAnswered, text: r.fired ? 'להמשך' : 'לחודש הבא ▸', onclick: () => {
+            const fired = r.fired;
+            E.closeMonth(S);
+            monthModalOpen = false;
+            close();
+            saveGame(true);
+            if (fired) firedModal();
+            else gameScreen();
+          } })));
+        body.replaceChildren(...parts);
+      };
+      render();
+      return [body];
+    }, { wide: true, locked: true });
+  }
+
+  function firedModal() {
+    const offers = E.jobOffers(S);
+    openModal((close) => [modalHead('פוטרת!', null),
+      h('p', { text: 'ההנהלה החליטה להיפרד ממך. אלו ההצעות שקיבלת:' }),
+      h('div', { class: 'club-grid' }, offers.map((c) => h('div', { class: 'card tight club-card', onclick: () => {
+        E.takeJob(S, c.id);
+        close();
+        saveGame(true);
+        gameScreen();
+      } }, crest(c, true), h('div', { class: 'info' }, h('div', { class: 'name', text: c.name }), h('div', { class: 'muted', text: leagueName(c.league) })), ovrBadge(c.rep))))], { wide: true, locked: true });
+  }
+
+  function proReportModal(r, onClose) {
     const p = S.players[S.pro.pid];
     openModal((close) => [modalHead('סיכום המשחק שלך', close),
       h('div', { class: 'row', style: { justifyContent: 'space-around', textAlign: 'center' } },
@@ -952,7 +1184,7 @@
         h('div', null, h('div', { class: 'big-stat', text: String(r.goals) }), h('div', { class: 'muted', text: 'שערים' })),
         h('div', null, h('div', { class: 'big-stat', text: `+${r.xp}` }), h('div', { class: 'muted', text: 'ניסיון' }))),
       r.gains.length ? h('p', { class: 'good', text: `השתפרת! ${r.gains.map((g) => (p.pos === 'GK' ? E.GK_ATTR_HE : E.ATTR_HE)[g.idx]).join(', ')} עלו. דירוג כללי: ${p.ovr}` }) : null,
-      h('button', { class: 'primary', text: 'המשך', onclick: close })]);
+      h('button', { class: 'primary', text: 'המשך', onclick: close })], { onClose });
   }
 
   function seasonEndModal(sm) {
@@ -1009,6 +1241,10 @@
     const statsEl = h('div');
     const controls = h('div', { class: 'row' });
     const endBox = h('div');
+    const ball = h('div', { class: 'ball' });
+    let mom = 0;
+    let live = false;
+    const ICONS = { goal: '⚽', yellow: '🟨', red: '🟥', sub: '🔁', injury: '✚', save: '🧤', miss: '💨', post: '🥅', pro: '⭐', chance: '➜', half: '⏸', second: '▶', end: '🏁', kickoff: '🏁' };
 
     const team = (s) => h('div', { class: 'team' }, crest(s.club, true), h('span', { text: s.club.name }));
     const render = () => {
@@ -1018,9 +1254,19 @@
         const e = sim.events[shown];
         if (!e.text) continue;
         feed.prepend(h('div', { class: `ev ${e.type}` }, h('span', { class: 'm num', text: `${e.min}'` }),
-          e.side !== null && e.side !== undefined ? crest(sim.sides[e.side].club) : h('span', { text: '🔔' }),
+          h('span', { class: 'i', text: ICONS[e.type] || '•' }),
+          e.side !== null && e.side !== undefined ? crest(sim.sides[e.side].club) : null,
           h('span', { text: e.text })));
+        if (e.type === 'goal' && live) {
+          const flash = h('div', { class: 'goal-flash', text: 'גול!' });
+          flash.style.textShadow = `0 0 40px ${clubColor(sim.sides[e.side].club)}, 0 6px 0 rgba(0,0,0,.4)`;
+          document.body.appendChild(flash);
+          setTimeout(() => flash.remove(), 1500);
+          mom = e.side === 0 ? 1 : -1;
+        }
       }
+      // home plays right-to-left on the momentum track (home is on the right of the scoreboard)
+      ball.style.left = `${50 - mom * 42}%`;
       const tot = H.poss + A.poss || 1;
       const line = (label, a, b, fmt = (v) => String(v)) => h('div', { class: 'statline' },
         h('b', { class: 'num', text: fmt(a) }),
@@ -1036,13 +1282,20 @@
     };
     const stop = () => { clearInterval(timer); timer = null; renderControls(); };
     const tick = () => {
+      const before = H.poss;
+      const shotsBefore = [H.shots, A.shots];
       sim.step();
+      const homeBall = H.poss > before;
+      mom = mom * 0.75 + (homeBall ? 0.25 : -0.25);
+      if (H.shots > shotsBefore[0]) mom = 0.95;
+      if (A.shots > shotsBefore[1]) mom = -0.95;
+      live = true;
       if (sim.pending) {
         if (autoDecide) sim.resolve(E.autoChoice(sim.pending));
         else {
           stop();
           render();
-          decisionModal(sim, () => { render(); start(); });
+          decisionModal(sim, () => { render(); if (sim.done) { renderControls(); showEnd(); } else start(); });
           return;
         }
       }
@@ -1067,6 +1320,7 @@
             sim.step();
             if (sim.pending) sim.resolve(E.autoChoice(sim.pending));
           }
+          live = false;
           render();
           renderControls();
           showEnd();
@@ -1090,8 +1344,12 @@
       sim.proRole === 'start' ? '⭐ אתה פותח בהרכב. ברגעי מפתח תתבקש לקבל החלטה.' : sim.proSubMinute ? '⭐ אתה על הספסל. ייתכן שתיכנס במחצית השנייה.' : '⭐ אתה על הספסל.') : null;
     const lineupCard = (s) => h('div', { class: 'card tight' }, h('h3', { text: s.club.name }),
       s.onPitch.map((x) => h('div', { class: 'row', style: { gap: '6px', margin: '3px 0' } }, posPill(x.slot), h('span', { text: S.players[x.id].n }), ovrBadge(S.players[x.id].ovr))));
+    const board = h('div', { class: 'scoreboard' }, team(H), h('div', null, scoreEl, minuteEl), team(A));
+    board.style.background = `linear-gradient(90deg, ${alpha(clubColor(A.club), 0.45)}, #0b1d16 38%, #0b1d16 62%, ${alpha(clubColor(H.club), 0.45)})`;
     app.replaceChildren(h('main', { class: 'match' },
-      h('div', { class: 'scoreboard' }, team(H), h('div', null, scoreEl, minuteEl), team(A)),
+      board,
+      h('div', { class: 'momentum' }, h('div', { class: 'track' }, ball),
+        h('div', { class: 'lbls' }, h('span', { text: `🥅 השער של ${A.club.name}` }), h('span', { text: `השער של ${H.club.name} 🥅` }))),
       proBanner,
       h('div', { class: 'row', style: { margin: '12px 0' } }, controls),
       h('div', { class: 'grid two' },

@@ -26,12 +26,14 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8',
   '.ico': 'image/x-icon',
 };
 
 const SECURITY_HEADERS = {
   'Content-Security-Policy':
-    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; " +
     "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',

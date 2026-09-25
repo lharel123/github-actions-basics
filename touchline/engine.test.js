@@ -181,3 +181,70 @@ describe('valuation', () => {
     expect(E.pre('ל', 'מכבי חיפה')).toBe('למכבי חיפה');
   });
 });
+
+describe('monthly cycle', () => {
+  test('each month produces a review with decisions, and closing needs every decision answered', () => {
+    E.setSeed(21);
+    const s = freshManager('maccabi-tel-aviv');
+    let reviews = 0;
+    for (let w = 0; w < 20; w++) {
+      E.playWeek(s);
+      E.afterWeek(s);
+      const r = s.pendingMonth;
+      if (!r) continue;
+      reviews++;
+      expect(r.label).toMatch(/20\d\d/);
+      expect(r.club).toBeDefined();
+      expect(r.confidence.to).toBeGreaterThanOrEqual(0);
+      if (r.decisions.length) {
+        expect(E.closeMonth(s)).toBe(false);
+        r.decisions.forEach((d, i) => expect(typeof E.answerDecision(s, i, d.options.length - 1)).toBe('string'));
+      }
+      expect(E.closeMonth(s)).toBe(true);
+      expect(s.pendingMonth).toBeNull();
+    }
+    expect(reviews).toBeGreaterThanOrEqual(4);
+    expect(s.monthHistory.length).toBe(reviews);
+  });
+
+  test('training plan changes recovery and match strength', () => {
+    const s = freshManager('maccabi-tel-aviv');
+    const club = s.clubs['maccabi-tel-aviv'];
+    E.setTraining(s, 'attack', 'intense');
+    expect(E.trainingOf(club)).toEqual({ focus: 'attack', intensity: 'intense' });
+    const sim = new E.MatchSim(s, 'maccabi-tel-aviv', 'maccabi-haifa');
+    const withFocus = sim.sides[0].r.att;
+    club.training = { focus: 'balanced', intensity: 'normal' };
+    sim.recalc();
+    expect(withFocus / sim.sides[0].r.att).toBeCloseTo(1.02, 3);
+  });
+
+  test('Be a Pro gets monthly reviews with pro decisions', () => {
+    E.setSeed(22);
+    const s = E.newState(world, { mode: 'pro' });
+    const club = E.proStartOffers(s, 'eng')[0];
+    E.createPro(s, { name: 'Pro', nat: 'Israel', pos: 'CM', clubId: club.id });
+    let seen = 0;
+    for (let w = 0; w < 14; w++) {
+      E.playWeek(s);
+      E.afterWeek(s);
+      if (!s.pendingMonth) continue;
+      seen++;
+      expect(s.pendingMonth.pro).toBeDefined();
+      s.pendingMonth.decisions.forEach((d, i) => E.answerDecision(s, i, 0));
+      E.closeMonth(s);
+    }
+    expect(seen).toBeGreaterThanOrEqual(2);
+    expect(s.pro.money).toBeGreaterThan(0);
+  });
+});
+
+describe('Israeli squads', () => {
+  test('include real players from Transfermarkt', () => {
+    const real = world.players.filter((p) => p.real);
+    expect(real.length).toBeGreaterThan(50);
+    const mta = world.players.filter((p) => p.c === 'maccabi-tel-aviv');
+    expect(mta.length).toBe(26);
+    expect(mta.some((p) => p.real)).toBe(true);
+  });
+});
