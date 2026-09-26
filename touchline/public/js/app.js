@@ -604,6 +604,7 @@
     openModal((close) => {
       const actions = h('div', { class: 'row', style: { marginTop: '14px' } });
       if (own) {
+        actions.append(h('span', { class: 'muted', text: 'אימון אישי:' }), planSelect(p, () => { close(); gameScreen(); playerModal(p.id); }));
         actions.append(
           h('button', { text: p.listed ? 'הסר מרשימת העברות' : 'הכנס לרשימת העברות', onclick: () => { p.listed = !p.listed; close(); toast(p.listed ? `${p.n} ברשימת העברות. הצעות יגיעו לדואר.` : 'הוסר מהרשימה'); gameScreen(); } }),
           h('button', { class: 'danger', text: 'שחרר', onclick: () => confirmBox(`לשחרר את ${p.n}? תשלם פיצוי על יתרת החוזה.`, () => {
@@ -963,7 +964,9 @@
         h('div', { class: 'card', style: { marginTop: '16px' } }, h('h3', { text: 'עצימות' }),
           h('div', { class: 'choices' }, Object.entries(E.TRAINING_INTENSITY).map(([k, it]) => h('button', {
             class: 'choice' + (tr.intensity === k ? ' selected' : ''), onclick: () => { E.setTraining(S, tr.focus, k); gameScreen(); },
-          }, h('b', { text: it.label }), h('small', { text: `התפתחות ×${it.dev} · התאוששות ${it.recovery}% בשבוע · סיכון פציעה ${(it.injury * 100).toFixed(2)}% לשחקן בשבוע` }))))));
+          }, h('b', { text: it.label }), h('small', { text: `התפתחות ×${it.dev} · התאוששות ${it.recovery}% בשבוע · סיכון פציעה ${(it.injury * 100).toFixed(2)}% לשחקן בשבוע` }))))),
+        facilitiesCard(club),
+        individualPlans(club));
       return;
     }
     const pro = S.pro;
@@ -982,6 +985,51 @@
           class: 'choice' + (intensity === k ? ' selected' : ''), onclick: () => { E.setTraining(S, pro.focus, k); gameScreen(); },
         }, h('b', { text: it.label }), h('small', { text: `ניסיון ×${it.dev} · סיכון פציעה ${(it.injury * 150).toFixed(2)}% בשבוע` }))))),
       h('p', { class: 'muted', text: `הדירוג הכללי מחושב לפי העמדה שלך (${E.POS_HE[p.pos]}), כך שהתכונות החשובות לעמדה משפיעות עליו יותר.` }));
+  }
+
+  function facilitiesCard(club) {
+    const lvl = E.facilitiesOf(club);
+    const cost = E.facilityUpgradeCost(club);
+    return h('div', { class: 'card', style: { marginTop: '16px' } },
+      h('div', { class: 'card-head' }, h('h3', { text: 'מתקני אימון' }), h('span', { class: 'warn', style: { fontSize: '20px', letterSpacing: '2px' }, text: '★'.repeat(lvl) + '☆'.repeat(5 - lvl) })),
+      h('p', { class: 'muted', text: `רמה ${lvl} מתוך 5. מכפיל התפתחות לכל הסגל: ×${E.FACILITY_DEV[lvl]}. מתקנים טובים מאטים גם את הירידה של שחקנים ותיקים.` }),
+      cost === null ? h('b', { class: 'good', text: 'המתקנים ברמה המקסימלית' })
+        : h('button', { class: 'primary', disabled: club.balance < cost, text: `שדרוג לרמה ${lvl + 1} · ${money(cost)}`, onclick: () => confirmBox(`לשדרג את המתקנים ב-${money(cost)}?`, () => {
+          const r = E.upgradeFacilities(S, club.id);
+          toast(r.reason);
+          saveGame(true);
+          gameScreen();
+        }) }));
+  }
+  const PLAN_POS = ['GK', 'CB', 'LB', 'RB', 'LWB', 'RWB', 'CDM', 'CM', 'CAM', 'LM', 'RM', 'LW', 'RW', 'ST'];
+  function planSelect(p, onChange) {
+    const labels = p.pos === 'GK' ? E.GK_ATTR_HE : E.ATTR_HE;
+    const cur = !p.plan ? '' : p.plan.type === 'attr' ? `a${p.plan.idx}` : `p${p.plan.pos}`;
+    return h('select', { onchange: (e) => {
+      const v = e.target.value;
+      E.setPlayerPlan(S, p.id, !v ? null : v[0] === 'a' ? { type: 'attr', idx: Number(v.slice(1)) } : { type: 'pos', pos: v.slice(1) });
+      onChange();
+    } },
+    h('option', { value: '', text: 'ללא (לפי תוכנית הקבוצה)' }),
+    h('optgroup', { label: 'שיפור תכונה' }, labels.map((l, i) => h('option', { value: `a${i}`, selected: cur === `a${i}`, text: `🎯 ${l}` }))),
+    h('optgroup', { label: 'הסבה לעמדה' }, PLAN_POS.filter((x) => x !== p.pos && !(p.alt || []).includes(x))
+      .map((x) => h('option', { value: `p${x}`, selected: cur === `p${x}`, text: `🔄 ${E.POS_HE[x]} (${x})` }))));
+  }
+  function individualPlans(club) {
+    const sq = E.squad(S, club.id).sort((a, b) => b.ovr - a.ovr);
+    return h('div', { class: 'card', style: { marginTop: '16px' } },
+      h('h3', { text: 'אימון אישי' }),
+      h('p', { class: 'muted', text: 'שחקן עם מיקוד אישי מתפתח מהר יותר (×1.5) בתכונה שבחרת. הסבה לעמדה חדשה לוקחת כמה חודשים, ובסופה השחקן יכול לשחק בה בלי קנס. שחקנים צעירים מתקדמים מהר יותר.' }),
+      h('div', { class: 'table-wrap' }, h('table', null,
+        h('thead', null, h('tr', null, ['עמדה', 'שחקן', 'גיל', 'יכולת', 'פוטנציאל', 'תוכנית', 'התקדמות'].map((t) => h('th', { text: t })))),
+        h('tbody', null, sq.map((p) => h('tr', null,
+          h('td', null, posPill(p.pos), ' ', (p.alt || []).map((a) => [posPill(a), ' '])),
+          h('td', { text: p.n }), h('td', { class: 'num', text: String(p.age) }), h('td', null, ovrBadge(p.ovr)),
+          h('td', { class: 'num muted', text: String(p.pot) }),
+          h('td', null, planSelect(p, () => gameScreen())),
+          h('td', { style: { minWidth: '110px' } }, p.plan && p.plan.type === 'pos'
+            ? h('div', null, h('div', { class: 'bar' }, h('i', { style: { width: `${p.plan.progress}%` } })), h('small', { class: 'muted', text: `${p.plan.progress}% · ${p.plan.pos}` }))
+            : p.plan ? h('span', { class: 'good', text: 'פעיל' }) : '')))))));
   }
 
   function historyView(main) {
@@ -1118,6 +1166,16 @@
             r.fired ? h('p', { class: 'bad', text: 'ההנהלה איבדה את האמון בך...' }) : null)
             : r.pro ? h('div', { class: 'card tight' }, h('h3', { text: 'מצב' }), h('div', { class: 'row' }, ring(S.pro.trust === undefined ? 50 : S.pro.trust), h('div', null, h('b', { text: 'אמון המאמן' }), h('div', { class: 'muted', text: `מוניטין ${r.pro.fame >= 0 ? '+' : ''}${r.pro.fame} החודש` })))) : null));
         if (r.news.length) parts.push(h('div', { style: { marginTop: '10px' } }, r.news.map((n) => h('p', { class: 'warn', text: `⚠ ${n}` }))));
+        const tr = r.trainingReport;
+        if (tr && (tr.up.length || tr.down.length || tr.learned.length || tr.progress.length)) {
+          const labels = E.ATTR_HE;
+          parts.push(h('div', { class: 'card tight', style: { marginTop: '14px' } }, h('h3', { text: 'דוח אימונים' }),
+            tr.up.length ? h('p', { style: { margin: '4px 0' } }, h('b', { class: 'good', text: '📈 השתפרו: ' }),
+              tr.up.map((x) => `${x.name} (${x.from}→${x.to}${x.attr !== null ? `, ${labels[x.attr]}` : ''})`).join(' · ')) : null,
+            tr.down.length ? h('p', { style: { margin: '4px 0' } }, h('b', { class: 'bad', text: '📉 ירדו: ' }), tr.down.map((x) => `${x.name} (${x.from}→${x.to})`).join(' · ')) : null,
+            tr.learned.length ? h('p', { style: { margin: '4px 0' } }, h('b', { class: 'warn', text: '🔄 סיימו הסבה: ' }), tr.learned.map((x) => `${x.name} → ${E.POS_HE[x.pos]}`).join(' · ')) : null,
+            tr.progress.length ? h('p', { class: 'muted', style: { margin: '4px 0' } }, 'בתהליך הסבה: ', tr.progress.map((x) => `${x.name} (${x.pos} ${x.progress}%)`).join(' · ')) : null));
+        }
         if (r.decisions.length) {
           parts.push(h('h3', { style: { marginTop: '18px' }, text: 'החלטות החודש' }));
           r.decisions.forEach((d, i) => {
@@ -1224,6 +1282,307 @@
     }, { wide: true, locked: true });
   }
 
+  // ---------- 2D match view ----------
+  // A top-down pitch drawn on a canvas. The engine simulates minute by minute; each minute
+  // becomes a short animation: who has the ball, a couple of passes, and the shot if there was one.
+  function colorDist(a, b) {
+    const pa = parseInt(String(a).slice(1, 7), 16);
+    const pb = parseInt(String(b).slice(1, 7), 16);
+    const d = [16, 8, 0].map((sh) => ((pa >> sh) & 255) - ((pb >> sh) & 255));
+    return Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+  }
+  function pitchView(sim) {
+    const L = 105;
+    const WD = 68;
+    const M = 3; // margin in metres
+    const canvas = h('canvas', { class: 'pitch2d' });
+    const ctx = canvas.getContext('2d');
+    const [H, A] = sim.sides;
+    const colH = clubColor(H.club);
+    let colA = clubColor(A.club);
+    if (colorDist(colH, colA) < 110) colA = A.club.colors.find((c) => colorDist(c, colH) >= 110) || (lightness(colH) > 128 ? '#1b1b1b' : '#f5f5f5');
+    const teamCol = [colH, colA];
+    const gkCol = ['#f4c542', '#9b5de5'];
+    const dirOf = (i) => (i === 0 ? -1 : 1); // home attacks towards x=0
+    const pos = new Map(); // player id -> {x, y, jx, jy}
+    const ball = { x: L / 2, y: WD / 2 };
+    let path = []; // [{x, y, t}] waypoints with arrival times
+    let carrier = null;
+    let atk = 0;
+    let running = true;
+    let last = performance.now();
+    let scale = 1;
+
+    const rand = (a, b) => a + Math.random() * (b - a);
+    function baseLayout(i) {
+      const s = sim.sides[i];
+      const slots = E.FORMATIONS[s.formation];
+      const pts = slotPositions(s.formation);
+      const used = new Set();
+      const out = new Map();
+      for (const x of s.onPitch) {
+        let k = slots.findIndex((sl, j) => sl === x.slot && !used.has(j));
+        if (k < 0) k = slots.findIndex((sl, j) => E.group(sl) === E.group(x.slot) && !used.has(j));
+        if (k >= 0) used.add(k);
+        const p = k >= 0 ? pts[k] : { x: 50, y: 50 };
+        const fx = i === 0 ? (p.y / 100) * L : (1 - p.y / 100) * L;
+        const fy = i === 0 ? (1 - p.x / 100) * WD : (p.x / 100) * WD;
+        out.set(x.id, { fx, fy, gk: x.slot === 'GK' });
+      }
+      return out;
+    }
+    function targets() {
+      const t = new Map();
+      for (let i = 0; i < 2; i++) {
+        const layout = baseLayout(i);
+        const attacking = i === atk;
+        const shift = (ball.x - L / 2) * 0.55 + (attacking ? dirOf(i) * 7 : -dirOf(i) * 3);
+        for (const [id, b] of layout) {
+          let x;
+          let y;
+          if (b.gk) {
+            x = i === 0 ? L - 2 : 2;
+            y = WD / 2 + (ball.y - WD / 2) * 0.15;
+          } else {
+            x = L / 2 + shift + (b.fx - L / 2) * 0.6;
+            y = WD / 2 + (b.fy - WD / 2) * 0.85 + (ball.y - WD / 2) * 0.25;
+          }
+          const p = pos.get(id);
+          if (p) {
+            x += p.jx;
+            y += p.jy;
+          }
+          t.set(id, { x: Math.max(1, Math.min(L - 1, x)), y: Math.max(1, Math.min(WD - 1, y)) });
+        }
+      }
+      // the closest two defenders press the ball, the carrier is on it
+      const def = sim.sides[1 - atk].onPitch.filter((x) => x.slot !== 'GK')
+        .map((x) => ({ id: x.id, d: dist(pos.get(x.id), ball) })).sort((a, b) => a.d - b.d).slice(0, 2);
+      for (const d of def) {
+        const tt = t.get(d.id);
+        if (tt) { tt.x += (ball.x - tt.x) * 0.6; tt.y += (ball.y - tt.y) * 0.6; }
+      }
+      if (carrier && t.get(carrier)) t.set(carrier, { x: ball.x - dirOf(atk) * 0.9, y: ball.y });
+      return t;
+    }
+    function dist(a, b) {
+      if (!a || !b) return 999;
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+    function ensurePlayers() {
+      for (let i = 0; i < 2; i++) {
+        const layout = baseLayout(i);
+        for (const [id, b] of layout) {
+          if (!pos.has(id)) pos.set(id, { x: b.gk ? (i === 0 ? L - 2 : 2) : L / 2 + (b.fx - L / 2) * 0.6, y: b.fy, jx: 0, jy: 0 });
+        }
+      }
+      const live = new Set(sim.sides.flatMap((s) => s.onPitch.map((x) => x.id)));
+      for (const id of [...pos.keys()]) if (!live.has(id)) pos.delete(id);
+    }
+    function pickMate(i, forward) {
+      const s = sim.sides[i];
+      const cands = s.onPitch.filter((x) => x.slot !== 'GK' && x.id !== carrier);
+      if (!cands.length) return null;
+      // prefer players ahead of the ball when attacking forward
+      let best = null;
+      let bestW = -1;
+      for (const x of cands) {
+        const p = pos.get(x.id);
+        if (!p) continue;
+        const ahead = (p.x - ball.x) * dirOf(i);
+        const w = Math.random() * 10 + (forward ? ahead * 0.4 : 0) - Math.abs(p.y - ball.y) * 0.08 - dist(p, ball) * 0.05;
+        if (w > bestW) { bestW = w; best = x.id; }
+      }
+      return best;
+    }
+
+    // Called once per simulated minute.
+    function tick(info) {
+      ensurePlayers();
+      atk = info.atk;
+      for (const p of pos.values()) { p.jx = rand(-2.5, 2.5); p.jy = rand(-2.5, 2.5); }
+      const now = performance.now();
+      const dur = Math.max(120, info.dur * 0.95);
+      const shot = info.events.find((e) => ['goal', 'save', 'miss', 'post'].includes(e.type));
+      path = [];
+      if (shot) {
+        const i = shot.side;
+        atk = i;
+        const shooter = shot.scorer || shot.player;
+        const sp = pos.get(shooter);
+        if (sp) {
+          // the shooter arrives at the edge of the box
+          sp.x = i === 0 ? rand(11, 20) : L - rand(11, 20);
+          sp.y = rand(WD / 2 - 12, WD / 2 + 12);
+        }
+        const goalX = i === 0 ? -1.2 : L + 1.2;
+        let end;
+        if (shot.type === 'goal') end = { x: goalX, y: WD / 2 + rand(-3, 3) };
+        else if (shot.type === 'post') end = { x: i === 0 ? 0 : L, y: WD / 2 + (Math.random() < 0.5 ? -3.66 : 3.66) };
+        else if (shot.type === 'save') end = { x: i === 0 ? 1.5 : L - 1.5, y: WD / 2 + rand(-2.5, 2.5) };
+        else end = { x: goalX - dirOf(i) * 1.5, y: WD / 2 + (Math.random() < 0.5 ? -1 : 1) * rand(5, 12) };
+        carrier = shooter;
+        if (sp) path.push({ x: sp.x, y: sp.y, t: now + dur * 0.45 });
+        path.push({ x: end.x, y: end.y, t: now + dur * 0.8 });
+        if (shot.type === 'save' || shot.type === 'miss' || shot.type === 'post') {
+          path.push({ x: end.x - dirOf(i) * (shot.type === 'save' ? 1 : -2), y: end.y, t: now + dur });
+        }
+        if (shot.type === 'goal') setTimeout(() => { ball.x = L / 2; ball.y = WD / 2; carrier = null; }, dur * 1.8);
+      } else {
+        const m1 = pickMate(atk, true);
+        if (m1) {
+          const p1 = pos.get(m1);
+          path.push({ x: p1.x, y: p1.y, t: now + dur * 0.5 });
+          carrier = m1;
+          if (Math.random() < 0.6) {
+            const keep = carrier;
+            const m2 = pickMate(atk, Math.random() < 0.7);
+            const p2 = m2 && pos.get(m2);
+            if (p2) path.push({ x: p2.x, y: p2.y, t: now + dur, id: m2 });
+            carrier = keep;
+          }
+        }
+      }
+      path.unshift({ x: ball.x, y: ball.y, t: now });
+    }
+
+    function advanceBall(now) {
+      if (path.length < 2) return;
+      while (path.length >= 2 && now >= path[1].t) {
+        path.shift();
+        if (path[0].id) carrier = path[0].id;
+      }
+      if (path.length < 2) {
+        ball.x = path[0].x;
+        ball.y = path[0].y;
+        return;
+      }
+      const [a, b] = path;
+      const k = Math.min(1, Math.max(0, (now - a.t) / Math.max(1, b.t - a.t)));
+      ball.x = a.x + (b.x - a.x) * k;
+      ball.y = a.y + (b.y - a.y) * k;
+    }
+
+    function resize() {
+      const w = canvas.parentElement ? canvas.parentElement.clientWidth : 600;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const hgt = Math.round((w * (WD + 2 * M)) / (L + 2 * M));
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(hgt * dpr);
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${hgt}px`;
+      scale = (w * dpr) / (L + 2 * M);
+    }
+    const X = (x) => (x + M) * scale;
+    const Y = (y) => (y + M) * scale;
+
+    function drawPitch() {
+      const w = canvas.width;
+      const hh = canvas.height;
+      for (let k = 0; k < 12; k++) {
+        ctx.fillStyle = k % 2 ? '#1c7a42' : '#1a6f3c';
+        ctx.fillRect((w / 12) * k, 0, w / 12 + 1, hh);
+      }
+      ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = Math.max(1, scale * 0.15);
+      ctx.strokeRect(X(0), Y(0), L * scale, WD * scale);
+      ctx.beginPath(); ctx.moveTo(X(L / 2), Y(0)); ctx.lineTo(X(L / 2), Y(WD)); ctx.stroke();
+      ctx.beginPath(); ctx.arc(X(L / 2), Y(WD / 2), 9.15 * scale, 0, Math.PI * 2); ctx.stroke();
+      for (const side of [0, 1]) {
+        const x0 = side ? L - 16.5 : 0;
+        ctx.strokeRect(X(x0), Y(WD / 2 - 20.15), 16.5 * scale, 40.3 * scale);
+        const x1 = side ? L - 5.5 : 0;
+        ctx.strokeRect(X(x1), Y(WD / 2 - 9.15), 5.5 * scale, 18.3 * scale);
+        ctx.beginPath(); ctx.arc(X(side ? L - 11 : 11), Y(WD / 2), 9.15 * scale, side ? Math.PI * 0.705 : -Math.PI * 0.295, side ? Math.PI * 1.295 : Math.PI * 0.295); ctx.stroke();
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.fillRect(X(side ? L : -2), Y(WD / 2 - 3.66), 2 * scale, 7.32 * scale);
+      }
+    }
+    function drawPlayer(id, i, slot) {
+      const p = pos.get(id);
+      if (!p) return;
+      const pl = S.players[id];
+      const r = 1.7 * scale;
+      ctx.beginPath();
+      ctx.arc(X(p.x), Y(p.y) + r * 0.25, r, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(X(p.x), Y(p.y), r, 0, Math.PI * 2);
+      ctx.fillStyle = slot === 'GK' ? gkCol[i] : teamCol[i];
+      ctx.fill();
+      ctx.lineWidth = Math.max(1, scale * 0.25);
+      ctx.strokeStyle = S.pro && id === S.pro.pid ? '#ffd166' : lightness(ctx.fillStyle) > 150 ? '#222' : '#fff';
+      if (S.pro && id === S.pro.pid) ctx.lineWidth = scale * 0.6;
+      ctx.stroke();
+      ctx.fillStyle = lightness(slot === 'GK' ? gkCol[i] : teamCol[i]) > 150 ? '#111' : '#fff';
+      ctx.font = `700 ${Math.round(r * 1.05)}px Heebo, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(pl && pl.no ? pl.no % 100 : ''), X(p.x), Y(p.y) + 0.5);
+    }
+    function draw() {
+      drawPitch();
+      for (let i = 0; i < 2; i++) for (const x of sim.sides[i].onPitch) drawPlayer(x.id, i, x.slot);
+      // ball
+      const r = 0.85 * scale;
+      ctx.beginPath(); ctx.arc(X(ball.x) + r * 0.4, Y(ball.y) + r * 0.5, r, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();
+      ctx.beginPath(); ctx.arc(X(ball.x), Y(ball.y), r, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.lineWidth = Math.max(1, scale * 0.12); ctx.strokeStyle = '#222'; ctx.stroke();
+      // name of the player on the ball
+      // label the player closest to the ball (if the ball is at someone's feet)
+      let near = null;
+      let nd = 3.2;
+      for (const [id, p] of pos) {
+        const d = Math.hypot(p.x - ball.x, p.y - ball.y);
+        if (d < nd) { nd = d; near = id; }
+      }
+      const cp = near && pos.get(near);
+      if (cp && S.players[near]) {
+        const name = S.players[near].n;
+        ctx.font = `700 ${Math.round(scale * 2.1)}px Heebo, sans-serif`;
+        const tw = ctx.measureText(name).width;
+        const bx = X(cp.x);
+        const by = Y(cp.y) - scale * 3.6;
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
+        ctx.fillRect(bx - tw / 2 - scale * 0.8, by - scale * 1.4, tw + scale * 1.6, scale * 2.8);
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(name, bx, by);
+      }
+    }
+    function frame(now) {
+      if (!running || !canvas.isConnected) {
+        if (!canvas.isConnected && running && performance.now() - created > 2000) running = false;
+        if (running) requestAnimationFrame(frame);
+        return;
+      }
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      advanceBall(now);
+      const t = targets();
+      const k = 1 - Math.exp(-dt * 3.2);
+      for (const [id, tg] of t) {
+        const p = pos.get(id);
+        if (!p) continue;
+        p.x += (tg.x - p.x) * k;
+        p.y += (tg.y - p.y) * k;
+      }
+      draw();
+      requestAnimationFrame(frame);
+    }
+    const created = performance.now();
+    ensurePlayers();
+    window.addEventListener('resize', resize);
+    requestAnimationFrame(() => { resize(); requestAnimationFrame(frame); });
+    return {
+      el: canvas,
+      tick,
+      stop() { running = false; window.removeEventListener('resize', resize); },
+    };
+  }
+
   // ---------- match screen ----------
   const SPEEDS = [['x1', 450], ['x3', 150], ['x10', 45]];
   let speedIdx = 1;
@@ -1241,7 +1600,7 @@
     const statsEl = h('div');
     const controls = h('div', { class: 'row' });
     const endBox = h('div');
-    const ball = h('div', { class: 'ball' });
+    const pv = pitchView(sim);
     let mom = 0;
     let live = false;
     const ICONS = { goal: '⚽', yellow: '🟨', red: '🟥', sub: '🔁', injury: '✚', save: '🧤', miss: '💨', post: '🥅', pro: '⭐', chance: '➜', half: '⏸', second: '▶', end: '🏁', kickoff: '🏁' };
@@ -1265,8 +1624,7 @@
           mom = e.side === 0 ? 1 : -1;
         }
       }
-      // home plays right-to-left on the momentum track (home is on the right of the scoreboard)
-      ball.style.left = `${50 - mom * 42}%`;
+
       const tot = H.poss + A.poss || 1;
       const line = (label, a, b, fmt = (v) => String(v)) => h('div', { class: 'statline' },
         h('b', { class: 'num', text: fmt(a) }),
@@ -1284,8 +1642,10 @@
     const tick = () => {
       const before = H.poss;
       const shotsBefore = [H.shots, A.shots];
+      const evBefore = sim.events.length;
       sim.step();
       const homeBall = H.poss > before;
+      pv.tick({ atk: homeBall ? 0 : 1, events: sim.events.slice(evBefore), dur: SPEEDS[speedIdx][1] });
       mom = mom * 0.75 + (homeBall ? 0.25 : -0.25);
       if (H.shots > shotsBefore[0]) mom = 0.95;
       if (A.shots > shotsBefore[1]) mom = -0.95;
@@ -1321,6 +1681,7 @@
             if (sim.pending) sim.resolve(E.autoChoice(sim.pending));
           }
           live = false;
+          pv.stop();
           render();
           renderControls();
           showEnd();
@@ -1337,7 +1698,7 @@
         h('div', { class: 'table-wrap' }, h('table', null, h('tbody', null, rows.map((p) => h('tr', { class: S.pro && p.id === S.pro.pid ? 'me' : '' },
           h('td', null, posPill(p.pos)), h('td', { text: p.n }), h('td', { class: 'num muted', text: `${side.played[p.id]}'` }),
           h('td', { class: 'num' }, h('b', { style: { color: ovrColor(ratings[p.id] * 10 + 10) }, text: ratings[p.id].toFixed(1) }))))))),
-        h('button', { class: 'primary', style: { marginTop: '12px' }, text: 'המשך ▸', onclick: () => finishWeek(sim) })));
+        h('button', { class: 'primary', style: { marginTop: '12px' }, text: 'המשך ▸', onclick: () => { pv.stop(); finishWeek(sim); } })));
     };
 
     const proBanner = S.mode === 'pro' ? h('div', { class: 'card tight', style: { marginTop: '10px' } },
@@ -1348,8 +1709,8 @@
     board.style.background = `linear-gradient(90deg, ${alpha(clubColor(A.club), 0.45)}, #0b1d16 38%, #0b1d16 62%, ${alpha(clubColor(H.club), 0.45)})`;
     app.replaceChildren(h('main', { class: 'match' },
       board,
-      h('div', { class: 'momentum' }, h('div', { class: 'track' }, ball),
-        h('div', { class: 'lbls' }, h('span', { text: `🥅 השער של ${A.club.name}` }), h('span', { text: `השער של ${H.club.name} 🥅` }))),
+      h('div', { class: 'pitch2d-wrap' }, pv.el,
+        h('div', { class: 'lbls' }, h('span', { text: `◀ ${H.club.name} תוקפת` }), h('span', { text: `${A.club.name} תוקפת ▶` }))),
       proBanner,
       h('div', { class: 'row', style: { margin: '12px 0' } }, controls),
       h('div', { class: 'grid two' },

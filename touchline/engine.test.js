@@ -248,3 +248,31 @@ describe('Israeli squads', () => {
     expect(mta.some((p) => p.real)).toBe(true);
   });
 });
+
+describe('training upgrades', () => {
+  test('facilities upgrade costs money and raises the level', () => {
+    const s = freshManager('maccabi-haifa');
+    const club = s.clubs['maccabi-haifa'];
+    const lvl = E.facilitiesOf(club);
+    const cost = E.facilityUpgradeCost(club);
+    club.balance = cost + 1;
+    expect(E.upgradeFacilities(s, club.id).ok).toBe(true);
+    expect(club.facilities).toBe(lvl + 1);
+    expect(club.balance).toBe(1);
+  });
+
+  test('a position retraining plan eventually teaches the new position', () => {
+    E.setSeed(31);
+    const s = freshManager('maccabi-haifa');
+    const p = E.squad(s, 'maccabi-haifa').find((x) => x.pos === 'CB');
+    E.setPlayerPlan(s, p.id, { type: 'pos', pos: 'CDM' });
+    expect(p.plan.progress).toBe(0);
+    for (let w = 0; w < 30 && p.plan; w++) {
+      E.playWeek(s);
+      E.afterWeek(s);
+      if (s.pendingMonth) { s.pendingMonth.decisions.forEach((d, i) => E.answerDecision(s, i, 0)); E.closeMonth(s); }
+    }
+    expect(p.plan).toBeUndefined();
+    expect(p.alt).toContain('CDM');
+  });
+});

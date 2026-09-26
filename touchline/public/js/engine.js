@@ -524,7 +524,7 @@
       if (!forced && rnd() > p) {
         if (this.detail && rnd() < 0.05) {
           const pid = this.pickPlayer(att, (pl, slot) => (group(slot) === 'A' ? 3 : group(slot) === 'M' ? 2 : 0.3));
-          if (pid) this.log('chance', atkIdx, { p: this.name(pid) });
+          if (pid) this.log('chance', atkIdx, { p: this.name(pid) }, { player: pid });
         }
         return;
       }
@@ -562,11 +562,11 @@
       if (onTarget) {
         att.sot++;
         if (gkId) this.bump(def, gkId, 0.18);
-        this.log('save', atkIdx, { p: this.name(shooter), g: gkId ? this.name(gkId) : '' });
+        this.log('save', atkIdx, { p: this.name(shooter), g: gkId ? this.name(gkId) : '' }, { player: shooter, keeper: gkId });
         return 'save';
       }
-      if (rnd() < 0.06) this.log('post', atkIdx, { p: this.name(shooter) });
-      else this.log('miss', atkIdx, { p: this.name(shooter) });
+      if (rnd() < 0.06) this.log('post', atkIdx, { p: this.name(shooter) }, { player: shooter });
+      else this.log('miss', atkIdx, { p: this.name(shooter) }, { player: shooter });
       return 'miss';
     }
 
@@ -1495,7 +1495,8 @@
 
   function proTrain(state) {
     const it = TRAINING_INTENSITY[state.pro.intensity] || TRAINING_INTENSITY.normal;
-    const gains = trainingGain(state, state.pro.focus, 15 * it.dev);
+    const club = state.clubs[state.players[state.pro.pid].c];
+    const gains = trainingGain(state, state.pro.focus, 15 * it.dev * FACILITY_DEV[facilitiesOf(club)]);
     const p = state.players[state.pro.pid];
     p.v = valueFor(p.ovr, p.age, p.pot);
     return gains;
@@ -1583,6 +1584,35 @@
   function monthLabel(key) {
     return `${MONTHS_HE[key % 12]} ${Math.floor(key / 12)}`;
   }
+  // Training facilities: level 1-5, multiplies monthly development of the whole squad.
+  const FACILITY_DEV = [0, 0.85, 1, 1.12, 1.24, 1.36];
+  function facilitiesOf(club) {
+    if (!club.facilities) club.facilities = club.rep >= 80 ? 4 : club.rep >= 72 ? 3 : club.rep >= 62 ? 2 : 1;
+    return club.facilities;
+  }
+  function facilityUpgradeCost(club) {
+    const lvl = facilitiesOf(club);
+    if (lvl >= 5) return null;
+    return Math.round((club.income * 2.2 * Math.pow(lvl, 1.2)) / 10000) * 10000;
+  }
+  function upgradeFacilities(state, clubId) {
+    const club = state.clubs[clubId];
+    const cost = facilityUpgradeCost(club);
+    if (cost === null) return { ok: false, reason: 'המתקנים כבר ברמה המקסימלית.' };
+    if (club.balance < cost) return { ok: false, reason: `השדרוג עולה ${money(cost)} ואין מספיק כסף.` };
+    club.balance -= cost;
+    club.facilities++;
+    return { ok: true, reason: `מתקני האימון שודרגו לרמה ${club.facilities}.` };
+  }
+  // Individual plan: { type: 'attr', idx } or { type: 'pos', pos, progress }
+  function setPlayerPlan(state, pid, plan) {
+    const p = state.players[pid];
+    if (!p) return;
+    if (!plan) delete p.plan;
+    else if (plan.type === 'attr' && plan.idx >= 0 && plan.idx <= 5) p.plan = { type: 'attr', idx: plan.idx };
+    else if (plan.type === 'pos' && GROUP[plan.pos] && plan.pos !== p.pos && !(p.alt || []).includes(plan.pos)) p.plan = { type: 'pos', pos: plan.pos, progress: 0 };
+  }
+
   function trainingOf(club) {
     return club.training || { focus: 'balanced', intensity: 'normal' };
   }
@@ -1637,27 +1667,47 @@
     }
   }
 
-  function monthlyDevelopment(state) {
+  // Returns a report for `reportClub`: who improved, declined and learned a position.
+  function monthlyDevelopment(state, reportClub) {
+    const report = { up: [], down: [], learned: [], progress: [] };
     for (const p of Object.values(state.players)) {
       if (state.pro && p.id === state.pro.pid) continue;
       const club = state.clubs[p.c];
       if (!club) continue;
+      const mine = p.c === reportClub;
       const tr = trainingOf(club);
       const it = TRAINING_INTENSITY[tr.intensity] || TRAINING_INTENSITY.normal;
       let chance = p.age <= 21 ? 0.3 : p.age <= 24 ? 0.18 : p.age <= 28 ? 0.05 : 0;
       if (tr.focus === 'youth') chance *= p.age <= 23 ? 1.45 : 0.6;
       if (tr.focus === 'rest') chance *= 0.3;
-      chance *= it.dev;
+      chance *= it.dev * FACILITY_DEV[facilitiesOf(club)];
+      const plan = p.plan;
+      if (plan && plan.type === 'attr') chance *= 1.5;
+      if (plan && plan.type === 'pos') {
+        const gain = Math.round(28 * it.dev * FACILITY_DEV[facilitiesOf(club)] * (p.age <= 24 ? 1.25 : p.age >= 30 ? 0.75 : 1) * (tr.focus === 'tactical' ? 1.2 : 1));
+        plan.progress = Math.min(100, plan.progress + gain);
+        if (plan.progress >= 100) {
+          p.alt = (p.alt || []).concat(plan.pos);
+          if (mine) report.learned.push({ pid: p.id, name: p.n, pos: plan.pos });
+          delete p.plan;
+        } else if (mine) report.progress.push({ pid: p.id, name: p.n, pos: plan.pos, progress: plan.progress });
+        chance *= 0.7; // time spent learning a position is not spent improving
+      }
       if (p.ovr < p.pot && rnd() < chance) {
+        const from = p.ovr;
         p.ovr++;
-        const idxs = FOCUS_ATTRS[tr.focus] || [rint(0, 5)];
-        for (const i of idxs) if (!(p.pos === 'GK' && i === 4)) p.at[i] = Math.min(99, p.at[i] + 1);
+        const idxs = plan && plan.type === 'attr' ? [plan.idx, plan.idx] : FOCUS_ATTRS[tr.focus] || [rint(0, 5)];
+        for (const i of idxs) if (!(p.pos === 'GK' && i === 4 && !(plan && plan.type === 'attr'))) p.at[i] = Math.min(99, p.at[i] + 1);
         p.v = valueFor(p.ovr, p.age, p.pot);
-      } else if (p.age >= 31 && rnd() < 0.06 * (tr.intensity === 'intense' ? 1.3 : 1)) {
+        if (mine) report.up.push({ pid: p.id, name: p.n, from, to: p.ovr, attr: plan && plan.type === 'attr' ? plan.idx : null });
+      } else if (p.age >= 31 && rnd() < 0.06 * (tr.intensity === 'intense' ? 1.3 : 1) / Math.max(0.8, FACILITY_DEV[facilitiesOf(club)])) {
+        const from = p.ovr;
         p.ovr = Math.max(40, p.ovr - 1);
         p.v = valueFor(p.ovr, p.age, p.pot);
+        if (mine) report.down.push({ pid: p.id, name: p.n, from, to: p.ovr });
       }
     }
+    return report;
   }
 
   function expectedPpg(state, clubId, expected) {
@@ -1668,8 +1718,9 @@
   function monthTurn(state) {
     const snap = state.monthSnap;
     const label = monthLabel(state.monthKey);
-    monthlyDevelopment(state);
-    const review = { key: state.monthKey, label, mode: state.mode, decisions: [], news: [] };
+    const devClub = state.mode === 'manager' && state.user ? state.user.clubId : null;
+    const trainingReport = monthlyDevelopment(state, devClub);
+    const review = { key: state.monthKey, label, mode: state.mode, decisions: [], news: [], trainingReport: devClub ? trainingReport : null };
     if (snap && state.clubs[snap.clubId]) {
       const clubId = snap.clubId;
       const lg = snap.league;
@@ -2150,6 +2201,6 @@
     expectedPosition, jobOffers, takeJob, valueFor, wageFor,
     proStartOffers, createPro, proSquadRole, proMatchSim, proAfterMatch, proAcceptOffer, proDeclineOffers, proOvr, proWeightKey,
     money, seasonLabel, avgRating, message, pre,
-    TRAINING_FOCUS, TRAINING_INTENSITY, monthLabel, monthKeyOf, closeMonth, answerDecision, setTraining, trainingOf, initMonth,
+    TRAINING_FOCUS, TRAINING_INTENSITY, facilitiesOf, facilityUpgradeCost, upgradeFacilities, setPlayerPlan, FACILITY_DEV, monthLabel, monthKeyOf, closeMonth, answerDecision, setTraining, trainingOf, initMonth,
   };
 });
