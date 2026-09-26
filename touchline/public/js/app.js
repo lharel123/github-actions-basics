@@ -55,7 +55,7 @@
     };
     const box = h('div', { class: 'modal' + (opts.wide ? ' wide' : '') });
     const overlay = h('div', { class: 'overlay', onclick: (e) => { if (e.target === overlay && !opts.locked) close(); } }, box);
-    box.append(...[].concat(build(close)));
+    box.append(...[].concat(build(close)).filter((x) => x !== null && x !== undefined && x !== false));
     modalRoot.appendChild(overlay);
     return close;
   }
@@ -377,7 +377,7 @@
 
   // ---------- game shell ----------
   const MANAGER_TABS = [['home', 'בית'], ['squad', 'סגל'], ['tactics', 'טקטיקה'], ['training', 'אימונים'], ['league', 'ליגות'], ['transfers', 'העברות'], ['inbox', 'דואר'], ['club', 'מועדון'], ['menu', 'תפריט']];
-  const PRO_TABS = [['home', 'הקריירה שלי'], ['training', 'אימון'], ['team', 'הקבוצה'], ['league', 'ליגות'], ['inbox', 'דואר'], ['history', 'היסטוריה'], ['menu', 'תפריט']];
+  const PRO_TABS = [['home', 'הקריירה שלי'], ['progress', 'יעדים והישגים'], ['training', 'אימון'], ['life', 'כסף וחוזה'], ['team', 'הקבוצה'], ['league', 'ליגות'], ['inbox', 'דואר'], ['history', 'היסטוריה'], ['menu', 'תפריט']];
 
   function lightness(hex) {
     const n = parseInt(String(hex).slice(1, 7), 16);
@@ -404,7 +404,7 @@
     const date = E.weekDate(S, S.week);
     const unread = S.inbox.filter((m) => !m.read).length;
     const fx = E.clubFixture(S, club.id, S.week);
-    const contLabel = S.pendingMonth ? '📅 סיכום חודשי' : fx && fx.m.hg === null ? '⚽ למשחק' : 'המשך ▸';
+    const contLabel = S.pendingInjury ? '🩹 פציעה' : S.pendingIntl ? '🎌 נבחרת' : S.pendingMonth ? '📅 סיכום חודשי' : fx && fx.m.hg === null ? '⚽ למשחק' : 'המשך ▸';
     const info = S.mode === 'manager'
       ? h('div', { class: 'row', style: { gap: '6px' } },
         h('span', { class: 'chip', text: `📅 ${dateFmt.format(date)}` }),
@@ -421,7 +421,7 @@
           h('div', { class: 'club' }, crest(club, true), h('div', null, h('div', { text: club.name }), h('div', { class: 'meta', text: leagueName(club.league) }))),
           info,
           h('div', { class: 'continue-wrap' },
-            h('button', { class: 'small', title: 'מדלג על כל המשחקים עד תחילת החודש הבא', text: '⏩ לחודש הבא', disabled: busy || !!S.pendingMonth, onclick: simToNextMonth }),
+            h('button', { class: 'small', title: 'מדלג על כל המשחקים עד תחילת החודש הבא', text: '⏩ לחודש הבא', disabled: busy || !!S.pendingMonth || !!S.pendingIntl || !!S.pendingInjury, onclick: simToNextMonth }),
             h('button', { class: 'primary continue', text: contLabel, disabled: busy, onclick: onContinue }))),
         h('div', { class: 'nav' }, tabs.map(([id, label]) => h('button', { class: tab === id ? 'active' : '', onclick: () => { tab = id; gameScreen(); } },
           label, id === 'inbox' && unread ? h('span', { class: 'count', text: String(unread) }) : null)))),
@@ -429,11 +429,11 @@
     const views = {
       home: S.mode === 'manager' ? homeManager : homePro, squad: (m) => squadView(userClubId(), true, m), tactics: tacticsView,
       league: leagueView, transfers: transfersView, inbox: inboxView, club: clubView, menu: menuView,
-      training: trainingView, team: (m) => squadView(userClubId(), false, m), history: historyView,
+      training: trainingView, team: (m) => squadView(userClubId(), false, m), history: historyView, progress: progressView, life: lifeView,
     };
     (views[tab] || views.home)(main);
     window.scrollTo(0, 0);
-    if (S.pendingMonth && !monthModalOpen && !busy && !suppressMonth) monthReviewModal();
+    showPending();
   }
 
   // ---------- manager home ----------
@@ -862,7 +862,10 @@
           h('button', { class: 'small', text: 'דחה', onclick: () => { E.rejectBid(S, m.id); gameScreen(); } }));
       }
       if (m.kind === 'proOffer' && !m.done) {
-        actions.push(h('button', { class: 'primary small', text: 'חתום', onclick: () => { toast(E.proAcceptOffer(S, m.offer.club) || ''); saveGame(true); gameScreen(); } }),
+        actions.push(h('button', { class: 'primary small', text: 'משא ומתן', onclick: () => {
+          const offer = S.pro.offers.find((o) => o.club === m.offer.club);
+          if (offer) negotiateModal(offer); else toast('ההצעה כבר לא בתוקף');
+        } }),
           h('button', { class: 'small', text: 'דחה הכל', onclick: () => { E.proDeclineOffers(S); gameScreen(); } }));
       }
       list.appendChild(h('div', { class: 'msg' + (m.read ? '' : ' unread'), onclick: () => { if (!m.read) { m.read = true; } } },
@@ -1032,6 +1035,161 @@
             : p.plan ? h('span', { class: 'good', text: 'פעיל' }) : '')))))));
   }
 
+  // ---------- Be a Pro: progress, life, contract, national team, injuries ----------
+  function progressView(main) {
+    const pro = S.pro;
+    const p = S.players[pro.pid];
+    const prog = E.objectiveProgress(S);
+    const perks = new Set(pro.perks || []);
+    const ach = pro.ach || {};
+    const thr = E.callUpThreshold(p.nat);
+    main.append(h('div', { class: 'grid two' },
+      h('div', { class: 'card' }, h('h3', { text: `יעדי העונה של ${S.clubs[p.c].name}` }),
+        prog.length ? prog.map((o) => h('div', { style: { margin: '10px 0' } },
+          h('div', { class: 'row spread' }, h('b', { text: o.label }), h('span', { class: 'num ' + (o.done ? 'good' : ''), text: `${o.type === 'rt' ? o.current.toFixed(2) : o.current} / ${o.type === 'rt' ? o.target.toFixed(1) : o.target}${o.done ? ' ✔' : ''}` })),
+          h('div', { class: 'bar' }, h('i', { style: { width: `${Math.min(100, (o.current / o.target) * 100)}%`, background: o.done ? 'var(--accent)' : 'var(--accent2)' } }))))
+          : h('p', { class: 'muted', text: 'היעדים ייקבעו בתחילת העונה.' }),
+        h('p', { class: 'muted', text: 'בסוף העונה כל יעד שהושג מביא בונוס כספי ומעלה את אמון המאמן. יעד שלא הושג מוריד אותו.' })),
+      h('div', { class: 'card' }, h('h3', { text: 'נבחרת' }),
+        h('div', { class: 'stat-tiles' },
+          [['הופעות', pro.caps || 0], ['שערים', pro.intlGoals || 0], ['חוזק הנבחרת', E.nationStrength(p.nat)], ['סף זימון', thr]].map(([l, v]) => h('div', { class: 'stat-tile' }, h('b', { class: 'num', text: String(v) }), h('span', { text: l })))),
+        h('p', { class: p.ovr >= thr ? 'good' : 'muted', text: p.ovr >= thr ? `אתה ברמה של נבחרת ${natName(p.nat)}. זימונים מגיעים באוקטובר, בדצמבר ובמרץ, ובקיץ יש מונדיאל או יורו.` : `כדי להיות מזומן לנבחרת ${natName(p.nat)} צריך דירוג ${thr} (עכשיו ${p.ovr}).` })),
+      h('div', { class: 'card span-all' }, h('h3', { text: 'יכולות מיוחדות' }),
+        h('div', { class: 'choices' }, Object.entries(E.PERKS).map(([id, pk]) => h('div', { class: 'choice' + (perks.has(id) ? ' selected' : '') },
+          h('b', { text: `${perks.has(id) ? '✨' : '🔒'} ${pk.name}` }), h('small', { text: pk.desc }), h('small', { class: perks.has(id) ? 'good' : 'warn', text: perks.has(id) ? 'פתוח' : `דרישה: ${pk.req}` }))))),
+      h('div', { class: 'card span-all' }, h('h3', { text: `הישגים (${Object.keys(ach).length}/${Object.keys(E.ACHIEVEMENTS).length})` }),
+        h('div', { class: 'choices' }, Object.entries(E.ACHIEVEMENTS).map(([id, a]) => h('div', { class: 'choice' + (ach[id] ? ' selected' : ''), style: { opacity: ach[id] ? 1 : 0.45 } },
+          h('b', { text: `${a.ico} ${a.name}` }), h('small', { text: ach[id] ? `עונת ${E.seasonLabel(ach[id].season)}` : 'עוד לא' })))))));
+  }
+
+  function lifeView(main) {
+    const pro = S.pro;
+    const p = S.players[pro.pid];
+    const club = S.clubs[p.c];
+    const roleName = { star: 'כוכב', rotation: 'רוטציה', prospect: 'צעיר מבטיח' }[pro.contractRole || 'rotation'];
+    const chem = Math.round((pro.chem || {})[p.c] || 0);
+    main.append(
+      h('div', { class: 'kpis' },
+        kpi('💶', 'חשבון בנק', h('span', { class: 'num', text: money(pro.money || 0) }), `שכר ${money(p.w)} לשבוע`),
+        kpi('', 'אוהדים', `${Math.round(pro.fans === undefined ? 50 : pro.fans)}%`, 'עולה עם ציונים טובים', ring(pro.fans === undefined ? 50 : pro.fans)),
+        kpi('', 'כימיה עם הקבוצה', `${chem}%`, 'משפרת מסירות ברגעי המשחק', ring(chem, 'var(--info)')),
+        kpi('©️', 'קפטן', pro.captain === p.c ? 'כן' : 'לא', pro.captain === p.c ? 'יכולת "מנהיג" פעילה' : 'דורש אמון, אוהדים וותק')),
+      h('div', { class: 'grid two' },
+        h('div', { class: 'card' }, h('h3', { text: 'חוזה וסוכן' }),
+          h('dl', { class: 'kv' },
+            h('dt', { text: 'קבוצה' }), h('dd', null, clubLabel(club), pro.loanActive ? h('span', { class: 'tag', text: ` בהשאלה מ-${S.clubs[pro.loanActive.parent].name}` }) : null),
+            h('dt', { text: 'מעמד בחוזה' }), h('dd', { text: roleName }),
+            h('dt', { text: 'שכר' }), h('dd', { class: 'num', text: `${money(p.w)} לשבוע` }),
+            h('dt', { text: 'חוזה עד' }), h('dd', { text: String(p.ctr) }),
+            h('dt', { text: 'סעיף שחרור' }), h('dd', { class: 'num', text: pro.releaseClause ? money(pro.releaseClause) : 'אין' }),
+            h('dt', { text: 'בקשת העברה' }), h('dd', { text: pro.transferRequest ? 'פעילה' : 'לא' })),
+          h('div', { class: 'row', style: { marginTop: '12px' } },
+            h('button', { disabled: !!pro.transferRequest, text: 'לבקש העברה', onclick: () => confirmBox('לבקש העברה? אמון המאמן ירד, אבל יגיעו יותר הצעות בחלון ההעברות.', () => { toast(E.requestTransfer(S)); saveGame(true); gameScreen(); }) }),
+            h('button', { disabled: !!pro.loanActive, text: 'לבקש השאלה', onclick: () => confirmBox('לצאת להשאלה עד סוף העונה לקבוצה שבה תשחק יותר?', () => { const r = E.requestLoan(S); toast(r.text, 4000); saveGame(true); gameScreen(); }) })),
+          h('p', { class: 'muted', text: 'כשמגיעה הצעה מקבוצה אחרת (בדואר), אפשר לנהל משא ומתן על השכר, המעמד וסעיף השחרור.' })),
+        h('div', { class: 'card' }, h('h3', { text: 'צוות אישי (עלות שבועית)' }),
+          Object.entries(E.SERVICES).map(([id, sv]) => h('div', { class: 'row spread', style: { padding: '8px 0', borderBottom: '1px solid var(--line)' } },
+            h('div', null, h('b', { text: sv.name }), h('div', { class: 'muted', style: { fontSize: '12px' }, text: sv.desc })),
+            h('div', { class: 'row', style: { flexWrap: 'nowrap', flex: 'none' } }, h('span', { class: 'num muted', text: `${money(E.serviceCost(S, id))}/שבוע` }),
+              h('button', { class: pro.services && pro.services[id] ? 'primary small' : 'small', text: pro.services && pro.services[id] ? 'פעיל' : 'לשכור', onclick: () => { E.toggleService(S, id); gameScreen(); } }))))),
+        h('div', { class: 'card span-all' }, h('h3', { text: 'קניות' }),
+          h('div', { class: 'choices' }, Object.entries(E.PURCHASES).map(([id, it]) => h('div', { class: 'choice' + (pro.bought && pro.bought[id] ? ' selected' : '') },
+            h('b', { text: it.name }), h('small', { text: it.desc }), h('small', { class: 'num', text: money(it.cost) }),
+            pro.bought && pro.bought[id] ? h('small', { class: 'good', text: '✔ שלך' })
+              : h('button', { class: 'small', disabled: (pro.money || 0) < it.cost, text: 'לקנות', onclick: () => { const r = E.buy(S, id); toast(r.reason); saveGame(true); gameScreen(); } })))))));
+  }
+
+  function negotiateModal(offer) {
+    const club = S.clubs[offer.club];
+    const p = S.players[S.pro.pid];
+    const t = { wage: 'fair', role: p.age <= 20 ? 'prospect' : 'rotation', clause: false };
+    openModal((close) => {
+      const body = h('div');
+      const render = () => {
+        const opt = (key, val, label, sub) => h('button', { class: 'choice' + (t[key] === val ? ' selected' : ''), onclick: () => { t[key] = val; render(); } }, h('b', { text: label }), sub ? h('small', { text: sub }) : null);
+        body.replaceChildren(
+          modalHead(`משא ומתן עם ${club.name}`, close),
+          h('p', { class: 'muted', text: `דמי העברה: ${money(offer.fee)}. השכר ההתחלתי שהוצע: ${money(offer.wage)} לשבוע.` }),
+          h('h3', { text: 'שכר' }),
+          h('div', { class: 'choices' }, opt('wage', 'low', `${money(Math.round(offer.wage * 0.9))}`, 'כמעט בטוח שיסכימו'), opt('wage', 'fair', `${money(offer.wage)}`, 'סביר'), opt('wage', 'high', `${money(Math.round(offer.wage * 1.35))}`, 'סיכון שיבטלו')),
+          h('h3', { style: { marginTop: '12px' }, text: 'מעמד' }),
+          h('div', { class: 'choices' }, opt('role', 'star', 'כוכב', `אמון גבוה ויעדים גבוהים. ${p.ovr >= club.rep + 2 ? '' : 'קשה לקבל ברמה שלך.'}`), opt('role', 'rotation', 'רוטציה', 'סטנדרטי'), opt('role', 'prospect', 'צעיר מבטיח', 'יעדים נמוכים, עד גיל 22')),
+          h('label', { class: 'row', style: { marginTop: '12px' } }, h('input', { type: 'checkbox', checked: t.clause, onchange: (e) => { t.clause = e.target.checked; } }), 'לדרוש סעיף שחרור (מקטין סיכוי)'),
+          h('div', { class: 'row', style: { marginTop: '16px' } },
+            h('button', { class: 'primary', text: 'להגיש', onclick: () => {
+              const r = E.proNegotiate(S, offer.club, t);
+              close();
+              toast(r.text, 4500);
+              saveGame(true);
+              gameScreen();
+            } }),
+            h('button', { text: 'ביטול', onclick: close })));
+      };
+      render();
+      return [body];
+    }, { wide: true });
+  }
+
+  let intlOpen = false;
+  function intlModal() {
+    if (!S.pendingIntl || intlOpen) return;
+    intlOpen = true;
+    const p = S.players[S.pro.pid];
+    openModal((close) => {
+      const body = h('div');
+      const render = (last) => {
+        const im = S.pendingIntl;
+        const head = h('div', null, h('div', { class: 'muted', text: im.label }),
+          h('h2', { class: 'month-title', text: `${natName(p.nat)} נגד ${im.opp.name}` }),
+          h('div', { class: 'muted', text: `חוזק ${im.us} מול ${im.opp.strength}` }));
+        if (!im.done) {
+          const m = im.current || E.intlNext(S);
+          if (m) {
+            body.replaceChildren(...[head, last ? h('p', { class: last.ok ? 'good' : 'bad', text: last.text }) : null,
+              h('div', { class: 'decision' }, h('h2', { text: `🎌 ${m.title}` }), h('p', { text: m.desc }),
+                m.options.map((o, i) => h('button', { class: 'opt', onclick: () => render(E.answerIntl(S, i)) }, h('span', { text: o.label }), h('span', { class: 'p', text: `${Math.round(o.p * 100)}%` })))),
+              h('div', { class: 'muted', text: `רגע ${im.idx + 1} מתוך ${im.moments} · ${im.gf}-${im.ga}` })].filter(Boolean));
+            return;
+          }
+        }
+        body.replaceChildren(...[head, last ? h('p', { class: last.ok ? 'good' : 'bad', text: last.text }) : null,
+          h('div', { class: 'scoreboard', style: { marginTop: '12px' } }, h('div', { class: 'team', text: natName(p.nat) }), h('div', { class: 'score', text: `${im.gf} - ${im.ga}` }), h('div', { class: 'team', text: im.opp.name })),
+          im.pens !== undefined ? h('p', { class: 'muted', text: im.pens ? 'ניצחון בפנדלים!' : 'הפסד בפנדלים...' }) : null,
+          h('button', { class: 'primary', style: { marginTop: '14px' }, text: 'המשך', onclick: () => {
+            const res = E.closeIntl(S);
+            saveGame(true);
+            if (res && !res.over) { render(); return; }
+            close();
+            intlOpen = false;
+            if (res && res.text) toast(res.text, 5000);
+            gameScreen();
+          } })].filter(Boolean));
+      };
+      render();
+      return [body];
+    }, { wide: true, locked: true });
+  }
+
+  let injuryOpen = false;
+  function injuryModal() {
+    if (!S.pendingInjury || injuryOpen) return;
+    injuryOpen = true;
+    openModal((close) => [modalHead('נפצעת באימון', null),
+      h('p', { text: `הרופא אומר שצריך לנוח ${S.pendingInjury.weeks} שבועות. אפשר גם לנסות לשחק עם כאבים.` }),
+      h('div', { class: 'choices' },
+        h('button', { class: 'choice', onclick: () => { toast(E.answerInjury(S, true)); injuryOpen = false; close(); saveGame(true); gameScreen(); } }, h('b', { text: 'לשחק דרך הכאב' }), h('small', { text: 'תשחק כבר השבוע, אבל יש 35% שהפציעה תחמיר ותעדר יותר זמן.' })),
+        h('button', { class: 'choice', onclick: () => { toast(E.answerInjury(S, false)); injuryOpen = false; close(); saveGame(true); gameScreen(); } }, h('b', { text: 'לנוח' }), h('small', { text: 'בטוח, אבל תפספס משחקים.' })))], { locked: true });
+  }
+
+  // Shows whichever pending event blocks the game (injury > national team > monthly review).
+  function showPending() {
+    if (!S || busy || suppressMonth) return false;
+    if (S.pendingInjury) { injuryModal(); return true; }
+    if (S.pendingIntl) { intlModal(); return true; }
+    if (S.pendingMonth) { monthReviewModal(); return true; }
+    return false;
+  }
+
   function historyView(main) {
     const pro = S.pro;
     const p = S.players[pro.pid];
@@ -1048,7 +1206,7 @@
   // ---------- advancing time ----------
   async function onContinue() {
     if (busy) return;
-    if (S.pendingMonth) return monthReviewModal();
+    if (showPending()) return;
     const clubId = userClubId();
     const fx = E.clubFixture(S, clubId, S.week);
     if (fx && fx.m.hg === null) {
@@ -1094,7 +1252,7 @@
     if (report) {
       proReportModal(proReport, () => {
         suppressMonth = false;
-        if (S.pendingMonth) monthReviewModal();
+        showPending();
       });
     }
     if (summary) seasonEndModal(summary);
@@ -1102,7 +1260,7 @@
 
   // Simulates week after week (the user's matches too) until a new month starts.
   function simToNextMonth() {
-    if (busy || S.pendingMonth) return;
+    if (busy || S.pendingMonth || S.pendingIntl || S.pendingInjury) return;
     busy = true;
     gameScreen();
     toast('מדלג לחודש הבא...');
@@ -1122,7 +1280,7 @@
       const r = advanceWeek(sim);
       summary = r.summary;
       weeks++;
-      if (!summary && !S.pendingMonth && weeks < 8) return setTimeout(step, 0);
+      if (!summary && !S.pendingMonth && !S.pendingIntl && !S.pendingInjury && weeks < 8) return setTimeout(step, 0);
       busy = false;
       saveGame(true);
       gameScreen();
@@ -1241,8 +1399,15 @@
         h('div', null, h('div', { class: 'big-stat', text: String(r.mins) }), h('div', { class: 'muted', text: 'דקות' })),
         h('div', null, h('div', { class: 'big-stat', text: String(r.goals) }), h('div', { class: 'muted', text: 'שערים' })),
         h('div', null, h('div', { class: 'big-stat', text: `+${r.xp}` }), h('div', { class: 'muted', text: 'ניסיון' }))),
+      h('p', { class: 'muted', style: { textAlign: 'center' }, text: `${S.clubs[p.c].name} ${r.score[0]} - ${r.score[1]} ${r.opp}${r.assists ? ` · ${r.assists} בישולים` : ''}` }),
       r.gains.length ? h('p', { class: 'good', text: `השתפרת! ${r.gains.map((g) => (p.pos === 'GK' ? E.GK_ATTR_HE : E.ATTR_HE)[g.idx]).join(', ')} עלו. דירוג כללי: ${p.ovr}` }) : null,
-      h('button', { class: 'primary', text: 'המשך', onclick: close })], { onClose });
+      (r.newPerks || []).length ? h('p', { class: 'warn', text: `✨ יכולת חדשה: ${r.newPerks.map((id) => E.PERKS[id].name).join(', ')}` }) : null,
+      r.decisions && r.decisions.length ? h('div', { class: 'table-wrap' }, h('h3', { style: { marginTop: '12px' }, text: 'ההחלטות שלך' }), h('table', null, h('tbody', null, r.decisions.map((d) => h('tr', null,
+        h('td', { class: 'num muted', text: `${d.min}'` }), h('td', { text: d.title }), h('td', null, h('b', { text: d.choice }), d.pressure ? h('span', { class: 'tag', text: ' ⏱ לחץ' }) : null),
+        h('td', { class: 'num muted', text: `${Math.round(d.p * 100)}%` }),
+        h('td', { class: d.success ? 'good' : 'bad', text: d.success ? (d.result === 'goal' ? '⚽ גול' : d.result === 'chain' ? '✔ המשך' : '✔ הצליח') : '✖ נכשל' }),
+        h('td', { class: 'num ' + (d.delta >= 0 ? 'good' : 'bad'), text: `${d.delta >= 0 ? '+' : ''}${d.delta.toFixed(2)}` })))))) : null,
+      h('button', { class: 'primary', style: { marginTop: '12px' }, text: 'המשך', onclick: close })], { onClose, wide: true });
   }
 
   function seasonEndModal(sm) {
@@ -1267,8 +1432,19 @@
         }
       }
       if (sm.pro) {
+        const ob = sm.proObjectives;
         parts.push(h('div', { class: 'card', style: { marginBottom: '12px' } }, h('h3', { text: 'העונה שלך' }),
-          h('p', { text: `${sm.pro.st.app} הופעות · ${sm.pro.st.gl} שערים · ${sm.pro.st.as} בישולים · ציון ממוצע ${sm.pro.st.app ? (sm.pro.st.rt / sm.pro.st.app).toFixed(2) : '-'} · דירוג ${sm.pro.ovr}` })));
+          h('p', { text: `${sm.pro.st.app} הופעות · ${sm.pro.st.gl} שערים · ${sm.pro.st.as} בישולים · ציון ממוצע ${sm.pro.st.app ? (sm.pro.st.rt / sm.pro.st.app).toFixed(2) : '-'} · דירוג ${sm.pro.ovr}` }),
+          ob ? h('p', null, `יעדים: ${ob.met}/${ob.list.length} · בונוס ${money(ob.bonus)} · `, ob.list.map((o) => h('span', { class: o.done ? 'good' : 'bad', text: `${o.label} ${o.type === 'rt' ? o.current.toFixed(2) : o.current}/${o.target}  ` }))) : null));
+      }
+      if (sm.awards) {
+        const aw = sm.awards;
+        const who = (x) => (x ? `${x.name} (${S.clubs[x.club] ? S.clubs[x.club].name : ''})` : '-');
+        parts.push(h('div', { class: 'card', style: { marginBottom: '12px' } }, h('h3', { text: '🏆 פרסי העונה' }),
+          aw.ballon && aw.ballon.length ? h('div', { class: 'award', style: { marginBottom: '10px' } }, h('span', { class: 'ico', text: '🥇' }),
+            h('div', null, h('b', { text: `כדור הזהב: ${who(aw.ballon[0])}` }), h('div', { class: 'muted', text: `2. ${who(aw.ballon[1])} · 3. ${who(aw.ballon[2])}` }))) : null,
+          h('div', { class: 'table-wrap' }, h('table', null, h('thead', null, h('tr', null, ['ליגה', 'שחקן העונה', 'השחקן הצעיר'].map((t) => h('th', { text: t })))),
+            h('tbody', null, S.leagues.map((l) => h('tr', null, h('td', { text: leagueName(l.id) }), h('td', { text: who(aw.season[l.id]) }), h('td', { class: 'muted', text: who(aw.young[l.id]) }))))))));
       }
       parts.push(h('div', { class: 'table-wrap' }, h('table', null,
         h('thead', null, h('tr', null, ['ליגה', 'אלופה', 'עלו / ירדו', 'מלך השערים'].map((t) => h('th', { text: t })))),
@@ -1310,6 +1486,7 @@
     let carrier = null;
     let atk = 0;
     let running = true;
+    let focusId = null;
     let last = performance.now();
     let scale = 1;
 
@@ -1399,6 +1576,7 @@
     // Called once per simulated minute.
     function tick(info) {
       ensurePlayers();
+      focusId = null;
       atk = info.atk;
       for (const p of pos.values()) { p.jx = rand(-2.5, 2.5); p.jy = rand(-2.5, 2.5); }
       const now = performance.now();
@@ -1524,6 +1702,15 @@
     function draw() {
       drawPitch();
       for (let i = 0; i < 2; i++) for (const x of sim.sides[i].onPitch) drawPlayer(x.id, i, x.slot);
+      const fp = focusId && pos.get(focusId);
+      if (fp) {
+        const pulse = 2.6 + Math.sin(performance.now() / 180) * 0.6;
+        ctx.beginPath();
+        ctx.arc(X(fp.x), Y(fp.y), pulse * scale, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = scale * 0.35;
+        ctx.stroke();
+      }
       // ball
       const r = 0.85 * scale;
       ctx.beginPath(); ctx.arc(X(ball.x) + r * 0.4, Y(ball.y) + r * 0.5, r, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();
@@ -1579,6 +1766,13 @@
     return {
       el: canvas,
       tick,
+      focus(id) {
+        const p = pos.get(id);
+        if (!p) return;
+        focusId = id;
+        const now = performance.now();
+        path = [{ x: ball.x, y: ball.y, t: now }, { x: p.x - dirOf(atk) * 0.9, y: p.y, t: now + 350 }];
+      },
       stop() { running = false; window.removeEventListener('resize', resize); },
     };
   }
@@ -1655,6 +1849,7 @@
         else {
           stop();
           render();
+          if (S.pro) pv.focus(S.pro.pid);
           decisionModal(sim, () => { render(); if (sim.done) { renderControls(); showEnd(); } else start(); });
           return;
         }
@@ -1725,17 +1920,20 @@
   function decisionModal(sim, onDone) {
     const m = sim.pending;
     openModal((close) => [
-      h('div', { class: 'decision' },
-        h('div', { class: 'muted', text: `דקה ${sim.minute}'` }),
-        h('h2', { text: `⭐ ${m.title}` }),
+      h('div', { class: 'decision' + (m.injury ? ' injury' : '') },
+        h('div', { class: 'row spread' }, h('span', { class: 'muted', text: `דקה ${sim.minute}'` }),
+          m.pressure ? h('span', { class: 'tag', style: { background: 'rgba(255,107,107,.2)', color: '#ff9d9d' }, text: '⏱ לחץ של סוף משחק' }) : null),
+        h('h2', { text: `${m.injury ? '🩹' : m.penalty ? '🎯' : '⭐'} ${m.title}` }),
         h('p', { text: m.desc }),
-        m.options.map((o, i) => h('button', { class: 'opt', onclick: () => {
+        m.options.map((o, i) => h('button', { class: 'opt' + (o.perk ? ' perk' : ''), onclick: () => {
           const r = sim.resolve(i);
           close();
           toast(`${r.success ? '✅' : '❌'} ${r.text}${r.result === 'goal' ? ' ⚽ גול!' : ''}`, 2200);
-          onDone();
-        } }, h('span', { text: o.label }), h('span', { class: 'p', text: `${Math.round(o.p * 100)}%` }))),
-        h('p', { class: 'muted', text: 'האחוז הוא סיכוי ההצלחה של הפעולה עצמה, לפי התכונות שלך מול היריבה.' })),
+          if (r.chained && sim.pending) setTimeout(() => decisionModal(sim, onDone), 350);
+          else onDone();
+        } }, h('span', null, o.perk ? '✨ ' : '', o.label, o.boost ? h('small', { class: 'good', text: ` (+${o.boost}% מיכולות)` }) : null),
+        h('span', { class: 'p', text: `${Math.round(o.p * 100)}%` }))),
+        h('p', { class: 'muted', text: 'האחוז הוא סיכוי ההצלחה של הפעולה, לפי התכונות שלך מול היריבה, היכולות המיוחדות, הכימיה והלחץ.' })),
     ], { locked: true });
   }
 
@@ -1763,6 +1961,9 @@
           } }))];
     });
   }
+
+  // Open the page with #debug to inspect the game state from the console: __tl()
+  if (location.hash === '#debug') window.__tl = () => ({ S, refresh: gameScreen });
 
   startScreen();
 })();

@@ -106,6 +106,9 @@ describe('a full season', () => {
     for (const id of eng1Down) expect(s.clubs[id].league).toBe('eng2');
     for (const id of eng2Up) expect(s.clubs[id].league).toBe('eng1');
     for (const lg of s.leagues) expect(E.clubsIn(s, lg.id)).toHaveLength(sizes[lg.id]);
+    expect(summary.awards.ballon.length).toBeGreaterThanOrEqual(3);
+    for (const b of summary.awards.ballon) expect(world.leagues.find((l) => l.id === world.clubs.find((c) => c.id === b.club).league).tier).toBe(1);
+    expect(summary.awards.season.eng1).toBeDefined();
     expect(s.seasonYear).toBe(world.season + 1);
     expect(s.week).toBe(0);
     expect(Object.values(s.tables.eng1).every((r) => r.p === 0)).toBe(true);
@@ -275,4 +278,103 @@ describe('training upgrades', () => {
     expect(p.plan).toBeUndefined();
     expect(p.alt).toContain('CDM');
   });
+});
+
+describe('Be a Pro career systems', () => {
+  function proState(seed, pos = 'ST', country = 'isr') {
+    E.setSeed(seed);
+    const s = E.newState(world, { mode: 'pro' });
+    const club = E.proStartOffers(s, country)[0];
+    const p = E.createPro(s, { name: 'Pro', nat: 'Israel', pos, clubId: club.id });
+    return { s, p };
+  }
+
+  test('new pro gets objectives, a position-relevant training focus and empty collections', () => {
+    const { s } = proState(41, 'CB');
+    expect(s.pro.objectives.list.length).toBeGreaterThanOrEqual(3);
+    expect(s.pro.focus).toBe(4); // defending for a centre-back
+    expect(s.pro.perks).toEqual([]);
+  });
+
+  test('perks unlock from attributes and boost matching options', () => {
+    const { s, p } = proState(42);
+    p.at[1] = 80; // shooting
+    E.checkPerks(s);
+    expect(s.pro.perks).toEqual(expect.arrayContaining(['finesse', 'penalty']));
+  });
+
+  test('moments are finalised: perk options only with the perk, probabilities in range, chains resolve', () => {
+    const { s, p } = proState(43);
+    p.at = [85, 85, 85, 85, 40, 80];
+    p.ovr = 80;
+    E.checkPerks(s);
+    let seen = 0;
+    let chained = 0;
+    for (let w = 0; w < 10; w++) {
+      const fx = E.clubFixture(s, p.c, s.week);
+      let sim = null;
+      if (fx && fx.m.hg === null) {
+        sim = E.proMatchSim(s, fx);
+        while (!sim.done) {
+          sim.step();
+          while (sim.pending) {
+            seen++;
+            for (const o of sim.pending.options) {
+              expect(o.p).toBeGreaterThan(0);
+              expect(o.p).toBeLessThanOrEqual(0.95);
+              if (o.perk) expect(s.pro.perks).toContain(o.perk);
+            }
+            if (sim.resolve(0).chained) chained++;
+          }
+        }
+      }
+      const res = E.playWeek(s, sim);
+      if (sim) E.proAfterMatch(s, sim, res.find((x) => x.sim === sim).ratings);
+      E.afterWeek(s);
+      s.pendingMonth = null;
+      s.pendingInjury = null;
+      s.pendingIntl = null;
+    }
+    expect(seen).toBeGreaterThan(5);
+    expect(chained).toBeGreaterThanOrEqual(0);
+    expect(s.pro.ach.debut).toBeDefined();
+  });
+
+  test('negotiation moves the pro and sets the contract role', () => {
+    const { s, p } = proState(44);
+    const target = Object.values(s.clubs).find((c) => c.id !== p.c && c.league === 'isr1');
+    s.pro.offers.push({ club: target.id, fee: 1000000, wage: 5000 });
+    E.setSeed(1);
+    const r = E.proNegotiate(s, target.id, { wage: 'low', role: 'rotation', clause: false });
+    expect(r.ok).toBe(true);
+    expect(p.c).toBe(target.id);
+    expect(s.pro.contractRole).toBe('rotation');
+  });
+
+  test('money buys services and items', () => {
+    const { s } = proState(45);
+    s.pro.money = 1000000;
+    expect(E.buy(s, 'car').ok).toBe(true);
+    expect(E.buy(s, 'car').ok).toBe(false);
+    expect(E.toggleService(s, 'trainer')).toBe(true);
+    const before = s.pro.money;
+    E.playWeek(s);
+    E.afterWeek(s);
+    expect(s.pro.money).toBeLessThan(before + s.players[s.pro.pid].w);
+  });
+
+  test('a national team call-up plays out through moments', () => {
+    const { s, p } = proState(46);
+    p.ovr = 80;
+    s.week = 10;
+    E.playWeek(s);
+    E.afterWeek(s);
+    expect(s.pendingIntl).toBeTruthy();
+    while (E.intlNext(s)) E.answerIntl(s, 0);
+    expect(s.pendingIntl.done).toBe(true);
+    expect(E.closeIntl(s).over).toBe(true);
+    expect(s.pro.caps).toBe(1);
+    expect(s.pendingIntl).toBeNull();
+  });
+
 });

@@ -590,6 +590,10 @@
       } else if (rnd() < 0.0009) {
         const pid = this.pickPlayer(s, () => 1);
         if (!pid) return;
+        if (pid === this.proId && this.detail && !this.pending) {
+          this.pending = injuryMoment(this); // the pro decides whether to play on
+          return;
+        }
         const p = this.state.players[pid];
         p.inj = rint(1, 7);
         this.log('injury', i, { p: this.name(pid) }, { player: pid });
@@ -689,11 +693,11 @@
       if (!x) return false;
       const g = group(x.slot);
       const attacking = atkIdx === i;
-      const chance = attacking ? { A: 0.06, M: 0.045, D: 0.018, G: 0 }[g] : { A: 0.003, M: 0.022, D: 0.045, G: 0.03 }[g];
+      const chance = attacking ? { A: 0.05, M: 0.042, D: 0.018, G: 0 }[g] : { A: 0.003, M: 0.024, D: 0.048, G: 0.03 }[g];
       if (rnd() > chance) return false;
       const moment = buildMoment(this, x.slot, attacking);
       if (!moment) return false;
-      this.pending = moment;
+      this.pending = finalizeMoment(this, moment);
       return true;
     }
 
@@ -705,13 +709,39 @@
       const i = this.proSide;
       const s = this.sides[i];
       const success = rnd() < opt.p;
-      const res = opt.resolve(this, success);
-      this.bump(s, this.proId, success ? opt.good || 0.25 : opt.bad || -0.15);
+      let res = opt.resolve(this, success);
+      const delta = success ? (opt.good === undefined ? 0.25 : opt.good) : (opt.bad === undefined ? -0.15 : opt.bad);
+      this.bump(s, this.proId, delta);
       const text = (success ? opt.okText : opt.failText) || '';
-      this.events.push({ min: this.minute, type: 'pro', side: i, text: `⭐ ${text}`, success, result: res });
-      this.proLog.push({ min: this.minute, title: m.title, choice: opt.label, success, result: res });
-      if (this.minute >= 90 + this.stoppage[1]) this.finish();
-      return { success, result: res, text };
+      let chained = false;
+      if (success && opt.next) {
+        const nm = opt.next(this);
+        if (nm) {
+          this.pending = finalizeMoment(this, nm);
+          chained = true;
+          res = 'chain';
+        }
+      }
+      this.events.push({ min: this.minute, type: 'pro', side: i, text: `⭐ ${text}`, success, result: res, player: this.proId });
+      this.proLog.push({ min: this.minute, title: m.title, choice: opt.label, tags: opt.tags || [], p: opt.p, success, result: res, delta, pressure: !!m.pressure });
+      if (res === 'goal' && this.minute >= 80) this.lateGoal = (this.lateGoal || 0) + 1;
+      if (!chained && this.minute >= 90 + this.stoppage[1]) this.finish();
+      return { success, result: res, text, chained };
+    }
+
+    // A goal that is certain (penalty scored): same bookkeeping as a scored shot.
+    forceGoal(i, scorer, assist) {
+      const att = this.sides[i];
+      const def = this.sides[1 - i];
+      att.goals++;
+      att.shots++;
+      att.sot++;
+      att.xg += 0.76;
+      this.bump(att, scorer, 1.1);
+      if (assist) this.bump(att, assist, 0.6);
+      for (const x of def.onPitch) this.bump(def, x.id, group(x.slot) === 'D' || x.slot === 'GK' ? -0.25 : -0.08);
+      this.log('goal', i, { p: this.name(scorer), a: assist ? this.name(assist) : '' }, { scorer, assist });
+      return 'goal';
     }
 
     finish() {
@@ -754,6 +784,8 @@
   }
 
   // ---------- Be a Pro moment catalogue ----------
+  // Every option carries tags (shot, pass, dribble, run, aerial, tackle, block, save, penalty)
+  // so perks, pressure and chemistry can adjust it in finalizeMoment().
   function buildMoment(sim, slot, attacking) {
     const st = sim.state;
     const i = sim.proSide;
@@ -763,8 +795,10 @@
     const oppDef = opp.r.def;
     const oppAtt = opp.r.att;
     const g = group(slot);
+    const wide = ['LW', 'RW', 'LM', 'RM', 'LB', 'RB', 'LWB', 'RWB'].includes(slot);
     const conf = (me.morale - 50) / 500; // -0.1 .. +0.1
     const chanceP = (attr, base, spread) => clamp(base + (attr - oppDef) / (spread * 1.4) + conf, 0.05, 0.88);
+    const defP = (attr, base, spread) => clamp(base + (attr - oppAtt) / spread + conf, 0.06, 0.92);
     const mate = () => sim.pickPlayer(own, (pl, sl) => (group(sl) === 'A' ? 3 : group(sl) === 'M' ? 2 : 0.4), sim.proId);
     const shoot = (xg) => (s, ok) => {
       if (!ok) {
@@ -772,7 +806,7 @@
         own.xg += xg;
         return 'miss';
       }
-      return s.maybeShot(i, { shooter: sim.proId, xg: Math.min(0.42, xg * 1.25), assist: null }) || 'miss';
+      return s.maybeShot(i, { shooter: sim.proId, xg: Math.min(0.38, xg * 1.1), assist: null }) || 'miss';
     };
     const passTo = (xg) => (s, ok) => {
       if (!ok) return 'lost';
@@ -786,93 +820,248 @@
       if (!shooter) return 'lost';
       return s.maybeShot(1 - i, { shooter, xg: bad, assist: null }) || 'miss';
     };
-
+    const kept = (s, ok) => (ok ? 'kept' : 'lost');
     const [pac, sho, pas, dri, def, phy] = me.at;
+
+    // reusable follow-up moments (two-stage plays)
+    const oneOnOne = () => ({
+      title: 'אחד על אחד עם השוער!', desc: 'השארת את ההגנה מאחור. רק השוער לפניך.',
+      options: [
+        { label: 'לבעוט חזק', tags: ['shot'], p: chanceP(sho, 0.55, 45), resolve: shoot(0.3), value: 1.4, okText: 'בעיטה חזקה...', failText: 'השוער סגר את הזווית.', good: 0.3, bad: -0.3 },
+        { label: 'לכדרר את השוער', tags: ['dribble'], p: chanceP(dri, 0.45, 45), resolve: (s, ok) => (ok ? shoot(0.34)(s, true) : 'lost'), value: 1.5, okText: 'עברת את השוער!', failText: 'השוער לקח לך את הכדור מהרגליים.', good: 0.4, bad: -0.35 },
+        { label: 'צ\'יפ מעל השוער', tags: ['shot'], p: chanceP((sho + dri) / 2, 0.38, 40), resolve: shoot(0.33), value: 1.6, okText: 'צ\'יפ עדין...', failText: 'הצ\'יפ היה חלש מדי.', good: 0.45, bad: -0.3 },
+      ],
+    });
+    const cutInside = () => ({
+      title: 'חתכת פנימה! מה עכשיו?', desc: 'עברת את המגן ואתה בקצה הרחבה עם הרגל החזקה.',
+      options: [
+        { label: 'בעיטה מסובבת לפינה הרחוקה', tags: ['shot'], p: chanceP(sho, 0.36, 42), resolve: shoot(0.2), value: 1.3, okText: 'בעיטה מסובבת...', failText: 'הבעיטה עברה ליד.', good: 0.3, bad: -0.1 },
+        { label: 'מסירה לחלוץ ברחבה', tags: ['pass'], p: chanceP(pas, 0.52, 45), resolve: passTo(0.3), value: 1.1, okText: 'מסירה מדויקת!', failText: 'הבלם חתך.', good: 0.25, bad: -0.1 },
+      ],
+    });
+
+    // ----- goalkeeper -----
     if (g === 'G') {
+      const gkDef = (s, ok) => (ok ? 'won' : defend(0.45)(s, false));
+      return pick([
+        {
+          title: 'חלוץ יריב פורץ לבד מולך!', desc: `${opp.club.name} בהתקפה מתפרצת, החלוץ חמק מההגנה ורץ לעברך.`,
+          options: [
+            { label: 'לצאת מהשער ולסגור זווית', tags: ['save'], p: defP((me.at[0] + me.at[5]) / 2, 0.5, 60), resolve: defend(0.55), okText: 'יצאת בזמן ולקחת את הכדור מהרגליים שלו!', failText: 'יצאת מאוחר מדי...', good: 0.6 },
+            { label: 'להישאר על הקו ולחכות לבעיטה', tags: ['save'], p: defP(me.at[3], 0.45, 60), resolve: defend(0.4), okText: 'הצלה רפלקסיבית מדהימה!', failText: 'הבעיטה הייתה חזקה מדי.', good: 0.7 },
+          ],
+        },
+        {
+          title: 'הגבהה לתוך הרחבה שלך', desc: 'כדור גבוה נופל בין השוער לחלוצי היריבה.',
+          options: [
+            { label: 'לצאת ולתפוס', tags: ['save'], p: defP(me.at[1], 0.5, 55), resolve: gkDef, okText: 'תפיסה בטוחה באוויר!', failText: 'הכדור נשמט לך מהידיים!', good: 0.35, bad: -0.4 },
+            { label: 'להרחיק באגרוף', tags: ['save'], p: defP((me.at[1] + me.at[0]) / 2, 0.65, 60), resolve: gkDef, okText: 'אגרוף חזק החוצה.', failText: 'האגרוף נפל לרגלי יריב.', good: 0.2, bad: -0.3 },
+            { label: 'להישאר על הקו', tags: ['save'], p: defP(me.at[3], 0.4, 60), resolve: gkDef, okText: 'הנגיחה הגיעה אליך בדיוק.', failText: 'נגיחה מטווח קצר...', good: 0.3, bad: -0.2 },
+          ],
+        },
+        {
+          title: 'פנדל נגדך!', desc: 'השופט הצביע על הנקודה. החלוץ מסדר את הכדור.',
+          penalty: true,
+          options: [
+            { label: 'לזנק שמאלה', tags: ['save', 'penalty'], p: clamp(0.25 + (me.at[0] - 70) / 150, 0.12, 0.45), resolve: (s, ok) => (ok ? 'saved' : penaltyAgainst(s)), value: 1, okText: 'עצרת את הפנדל!!!', failText: 'החלוץ בעט לצד השני.', good: 1.0, bad: -0.05 },
+            { label: 'לזנק ימינה', tags: ['save', 'penalty'], p: clamp(0.25 + (me.at[0] - 70) / 150, 0.12, 0.45), resolve: (s, ok) => (ok ? 'saved' : penaltyAgainst(s)), value: 1, okText: 'עצרת את הפנדל!!!', failText: 'החלוץ בעט לצד השני.', good: 1.0, bad: -0.05 },
+            { label: 'להישאר במרכז', tags: ['save', 'penalty'], p: clamp(0.14 + (me.at[3] - 70) / 200, 0.08, 0.3), resolve: (s, ok) => (ok ? 'saved' : penaltyAgainst(s)), value: 1, okText: 'הוא ניסה פננקה ותפסת!', failText: 'בעיטה לפינה.', good: 1.1, bad: -0.05 },
+          ],
+        },
+      ]);
+    }
+    function penaltyAgainst(s) {
+      const shooter = s.pickPlayer(opp, (pl, sl) => (group(sl) === 'A' ? 4 : 1) * (pl.at[1] || 50));
+      if (rnd() < 0.08) return 'miss'; // it happens
+      return shooter ? s.forceGoal(1 - i, shooter, null) : 'miss';
+    }
+
+    // ----- defending -----
+    if (!attacking) {
+      const list = [
+        {
+          title: 'החלוץ היריב רץ לעברך עם הכדור', desc: `${opp.club.name} תוקפת, השחקן היריב מנסה לעבור אותך בדרך לרחבה.`,
+          options: [
+            { label: 'תיקול גלישה', tags: ['tackle'], p: defP(def, 0.35, 45), resolve: defend(0.35), okText: 'תיקול מושלם! לקחת את הכדור נקי.', failText: 'פספסת את התיקול והוא עבר אותך!', good: 0.5, bad: -0.35 },
+            { label: 'לעמוד מולו ולחסום', tags: ['block'], p: defP(def, 0.5, 50), resolve: defend(0.18), okText: 'חסמת אותו והכרחת אותו לאחור.', failText: 'הוא מצא זווית לבעיטה.', good: 0.3 },
+            { label: 'להוביל אותו לקו הצד', tags: ['run'], p: defP(pac, 0.62, 55), resolve: defend(0.1), okText: 'דחקת אותו החוצה, הכדור יצא לחוץ.', failText: 'הוא הגביה לרחבה.', good: 0.2 },
+          ],
+        },
+        {
+          title: 'הגבהה לרחבה שלך', desc: 'כדור גבוה נשלח לרחבה, חלוץ יריב ממתין מאחוריך.',
+          options: [
+            { label: 'לקפוץ ולהרחיק בראש', tags: ['aerial'], p: defP(phy, 0.5, 45), resolve: defend(0.3), okText: 'ניצחת בדו-קרב האווירי והרחקת!', failText: 'החלוץ היה גבוה יותר.', good: 0.35 },
+            { label: 'לעצור בחזה ולצאת עם הכדור', tags: ['dribble'], p: defP(dri, 0.35, 45), resolve: (s, ok) => (ok ? 'won' : defend(0.4)(s, false)), okText: 'איזו שליטה! יצאת מהלחץ בסטייל.', failText: 'איבדת את הכדור ברחבה!', good: 0.55, bad: -0.4 },
+          ],
+        },
+        {
+          title: 'מתפרצת 2 על 1 נגדכם!', desc: 'שני תוקפים רצים לעבר השער ורק אתה ביניהם לבין השוער.',
+          options: [
+            { label: 'לסגור את המוביל', tags: ['tackle'], p: defP((def + pac) / 2, 0.42, 45), resolve: defend(0.32), okText: 'לחצת עליו והוא איבד את הכדור!', failText: 'הוא מסר לחבר הפנוי...', good: 0.45, bad: -0.3 },
+            { label: 'לסגור את קו המסירה', tags: ['block'], p: defP(def, 0.48, 50), resolve: defend(0.22), okText: 'חתכת את המסירה!', failText: 'המוביל בעט בעצמו.', good: 0.4, bad: -0.2 },
+            { label: 'לסגת ולהשהות', tags: ['run'], p: defP(pac, 0.58, 55), resolve: defend(0.15), okText: 'השהית עד שהחברים חזרו.', failText: 'הם מצאו פתרון.', good: 0.25, bad: -0.15 },
+          ],
+        },
+      ];
+      if (g === 'M') {
+        list.push({
+          title: 'לחץ על הקשר היריב', desc: 'הקשר של היריבה קיבל כדור עם הגב לשער.',
+          options: [
+            { label: 'לחץ אגרסיבי מאחור', tags: ['tackle'], p: defP((def + phy) / 2, 0.45, 45), resolve: (s, ok) => (ok ? 'won' : 'lost'), okText: 'חטפת את הכדור ויצאת להתקפה!', failText: 'עבירה מיותרת.', good: 0.35, bad: -0.15 },
+            { label: 'לסגור שטח ולחכות', tags: ['block'], p: defP(def, 0.6, 55), resolve: kept, okText: 'אילצת אותו למסור אחורה.', failText: 'הוא הסתובב ופתח משחק.', good: 0.15, bad: -0.1 },
+          ],
+        });
+      }
+      return pick(list);
+    }
+
+    // ----- attacking -----
+    // penalty for the team's shooters
+    if ((g === 'A' || sho >= 72) && rnd() < 0.07) {
+      const pen = (quality) => (s, ok) => (ok ? s.forceGoal(i, sim.proId, null) : (own.shots++, own.xg += 0.76, rnd() < 0.5 ? 'saved' : 'miss'));
       return {
-        title: 'חלוץ יריב פורץ לבד מולך!',
-        desc: `${opp.club.name} בהתקפה מתפרצת, החלוץ חמק מההגנה ורץ לעברך.`,
+        title: 'פנדל!', desc: 'הכשילו אותך ברחבה והשופט שרק. אתה לוקח את הבעיטה.', penalty: true,
         options: [
-          { label: 'לצאת מהשער ולסגור זווית', p: chanceP((me.at[0] + me.at[5]) / 2, 0.5, 60), resolve: defend(0.55), okText: 'יצאת בזמן ולקחת את הכדור מהרגליים שלו!', failText: 'יצאת מאוחר מדי...', good: 0.6 },
-          { label: 'להישאר על הקו ולחכות לבעיטה', p: chanceP(me.at[3], 0.45, 60), resolve: defend(0.4), okText: 'הצלה רפלקסיבית מדהימה!', failText: 'הבעיטה הייתה חזקה מדי.', good: 0.7 },
+          { label: 'לפינה התחתונה', tags: ['penalty'], p: clamp(0.66 + (sho - 70) / 110 + conf, 0.45, 0.92), resolve: pen(1), value: 1.2, okText: 'גוול מהנקודה!', failText: 'השוער ניחש נכון.', good: 0.25, bad: -0.4 },
+          { label: 'לחיבורים בכוח', tags: ['penalty'], p: clamp(0.56 + (sho - 70) / 90 + conf, 0.35, 0.9), resolve: pen(1), value: 1.3, okText: 'טיל לחיבורים!', failText: 'עף מעל המשקוף...', good: 0.35, bad: -0.45 },
+          { label: 'פננקה', tags: ['penalty'], p: clamp(0.44 + (sho + dri - 140) / 120 + conf, 0.2, 0.8), resolve: pen(1), value: 1.6, okText: 'פננקה בקור רוח מטורף!', failText: 'השוער נשאר באמצע ותפס...', good: 0.6, bad: -0.8 },
         ],
       };
     }
-    if (!attacking) {
-      const moments = [
-        {
-          title: 'החלוץ היריב רץ לעברך עם הכדור',
-          desc: `${opp.club.name} תוקפת, השחקן היריב מנסה לעבור אותך בדרך לרחבה.`,
-          options: [
-            { label: 'תיקול גלישה', p: clamp(0.35 + (def - oppAtt) / 45 + conf, 0.08, 0.9), resolve: defend(0.35), okText: 'תיקול מושלם! לקחת את הכדור נקי.', failText: 'פספסת את התיקול והוא עבר אותך!', good: 0.5, bad: -0.35 },
-            { label: 'לעמוד מולו ולחסום', p: clamp(0.5 + (def - oppAtt) / 50 + conf, 0.1, 0.92), resolve: defend(0.18), okText: 'חסמת אותו והכרחת אותו לאחור.', failText: 'הוא מצא זווית לבעיטה.', good: 0.3 },
-            { label: 'להוביל אותו לקו הצד', p: clamp(0.62 + (pac - oppAtt) / 55 + conf, 0.15, 0.95), resolve: defend(0.1), okText: 'דחקת אותו החוצה, הכדור יצא לחוץ.', failText: 'הוא הגביה לרחבה.', good: 0.2 },
-          ],
-        },
-        {
-          title: 'הגבהה לרחבה שלך',
-          desc: 'כדור גבוה נשלח לרחבה, חלוץ יריב ממתין מאחוריך.',
-          options: [
-            { label: 'לקפוץ ולהרחיק בראש', p: clamp(0.5 + (phy - oppAtt) / 45 + conf, 0.1, 0.93), resolve: defend(0.3), okText: 'ניצחת בדו-קרב האווירי והרחקת!', failText: 'החלוץ היה גבוה יותר.', good: 0.35 },
-            { label: 'לעצור בחזה ולצאת עם הכדור', p: clamp(0.35 + (dri - oppAtt) / 45 + conf, 0.08, 0.85), resolve: (s, ok) => (ok ? 'won' : defend(0.4)(s, false)), okText: 'איזו שליטה! יצאת מהלחץ בסטייל.', failText: 'איבדת את הכדור ברחבה!', good: 0.55, bad: -0.4 },
-          ],
-        },
-      ];
-      return pick(moments);
+    const attackList = [];
+    if (g === 'A' || (g === 'M' && slot === 'CAM')) {
+      attackList.push({
+        title: 'אתה ברחבה עם הכדור!', desc: `קיבלת כדור בגובה 14 מטר, בלם של ${opp.club.name} מתקרב.`,
+        options: [
+          { label: 'בעיטה מיידית לפינה', tags: ['shot'], p: chanceP(sho, 0.42, 45), resolve: shoot(0.16), value: 1.3, okText: 'בעיטה מדויקת למסגרת!', failText: 'הבעיטה עפה מעל.', good: 0.2, bad: -0.15 },
+          { label: 'לקחת נגיעה ולסדר את הבעיטה', tags: ['dribble', 'shot'], p: chanceP((sho + dri) / 2, 0.32, 45), resolve: shoot(0.24), value: 1.5, okText: 'סידרת את עצמך מצוין ובעטת!', failText: 'הבלם חסם את הבעיטה.', good: 0.25, bad: -0.2 },
+          { label: 'בעיטה מסובבת לחיבורים', tags: ['shot'], perk: 'finesse', p: chanceP(sho, 0.38, 40), resolve: shoot(0.32), value: 1.6, okText: 'בעיטה מסובבת מושלמת...', failText: 'סיבוב אחד יותר מדי.', good: 0.4, bad: -0.1 },
+          { label: 'מסירה לחבר פנוי', tags: ['pass'], p: chanceP(pas, 0.6, 50), resolve: passTo(0.28), value: 0.9, okText: 'מסירה חכמה לחבר!', failText: 'המסירה נחתכה.', good: 0.2, bad: -0.15 },
+        ],
+      });
+      attackList.push({
+        title: 'הגבהה לרחבה!', desc: 'הכנף שלך מגביה, אתה מתרומם בין שני בלמים.',
+        options: [
+          { label: 'נגיחה לפינה', tags: ['aerial', 'shot'], p: chanceP((phy + sho) / 2, 0.36, 45), resolve: shoot(0.2), value: 1.3, okText: 'נגיחה חזקה...', failText: 'הנגיחה עברה מעל.', good: 0.3, bad: -0.1 },
+          { label: 'להוריד בראש לחבר', tags: ['aerial', 'pass'], p: chanceP((phy + pas) / 2, 0.5, 45), resolve: passTo(0.24), value: 1, okText: 'הורדה מדויקת!', failText: 'ההורדה נפלה לבלם.', good: 0.25, bad: -0.1 },
+          { label: 'לעצור בחזה ולבעוט', tags: ['dribble', 'shot'], p: chanceP((dri + sho) / 2, 0.3, 42), resolve: shoot(0.26), value: 1.4, okText: 'עצירה ובעיטה באוויר!', failText: 'הבלם הגיע קודם.', good: 0.4, bad: -0.15 },
+        ],
+      });
+      attackList.push({
+        title: 'מתפרצת! אתה רץ עם הכדור', desc: 'קיבלת כדור בחצי שלך ויש שטח פתוח לפניך.',
+        options: [
+          { label: 'לרוץ לבד לשער', tags: ['run'], p: chanceP((pac + dri) / 2, 0.42, 45), resolve: kept, next: oneOnOne, value: 1.3, okText: 'השארת את כולם מאחור!', failText: 'המגן השיג אותך.', good: 0.2, bad: -0.15 },
+          { label: 'טריק רולטה על המגן', tags: ['dribble'], perk: 'dribbler', p: chanceP(dri, 0.5, 42), resolve: kept, next: oneOnOne, value: 1.5, okText: 'רולטה! המגן על הדשא.', failText: 'הטריק לא יצא.', good: 0.35, bad: -0.2 },
+          { label: 'מסירת עומק לחלוץ', tags: ['pass'], p: chanceP(pas, 0.5, 45), resolve: passTo(0.3), value: 1.1, okText: 'מסירת עומק מושלמת!', failText: 'המסירה הייתה ארוכה מדי.', good: 0.3, bad: -0.1 },
+          { label: 'להאט ולחכות לחברים', tags: ['pass'], p: 0.85, resolve: kept, value: 0.2, okText: 'שמרת על הכדור.', failText: 'איבדת את הכדור.', good: 0.05 },
+        ],
+      });
     }
+    if (wide) {
+      attackList.push({
+        title: 'אתה בקו הצד מול המגן', desc: 'יש לך כדור בשליש האחרון, המגן היריב מולך.',
+        options: [
+          { label: 'הגבהה לנקודה הרחוקה', tags: ['pass'], p: chanceP(pas, 0.48, 45), resolve: passTo(0.2), value: 1, okText: 'הגבהה מושלמת!', failText: 'ההגבהה נחסמה.', good: 0.25, bad: -0.1 },
+          { label: 'כדור רוחב לאחור', tags: ['pass'], p: chanceP((pas + dri) / 2, 0.4, 45), resolve: passTo(0.28), value: 1.1, okText: 'כדור רוחב חכם!', failText: 'המגן חתך.', good: 0.3, bad: -0.1 },
+          { label: 'לחתוך פנימה', tags: ['dribble'], p: chanceP((dri + pac) / 2, 0.45, 45), resolve: kept, next: cutInside, value: 1.3, okText: 'חתכת פנימה!', failText: 'המגן לא נפל לזה.', good: 0.2, bad: -0.15 },
+          { label: 'לעבור בספרינט על הקו', tags: ['run'], perk: 'speedster', p: chanceP(pac, 0.55, 40), resolve: passTo(0.3), value: 1.3, okText: 'עפת על הקו והגבהת!', failText: 'המגן החזיק מעמד.', good: 0.35, bad: -0.1 },
+        ],
+      });
+    }
+    if (g === 'M' || g === 'D' || attackList.length === 0) {
+      attackList.push({
+        title: 'יש לך את הכדור במרכז המגרש', desc: 'לחץ של קשר יריב, חלוץ שלך מסמן לעומק.',
+        options: [
+          { label: 'מסירת עומק מסוכנת', tags: ['pass'], p: chanceP(pas, 0.38, 45), resolve: passTo(0.25), value: 1.2, okText: 'מסירה פותחת הגנה!', failText: 'המסירה נחתכה.', good: 0.3, bad: -0.2 },
+          { label: 'מסירת קסם בין הבלמים', tags: ['pass'], perk: 'playmaker', p: chanceP(pas, 0.4, 40), resolve: passTo(0.38), value: 1.5, okText: 'מסירת קסם! החלוץ לבד.', failText: 'רק סנטימטר אחד...', good: 0.45, bad: -0.1 },
+          { label: 'בעיטה מרחוק', tags: ['shot'], p: chanceP(sho, 0.35, 45), resolve: shoot(0.05), value: 0.8, okText: 'בעיטה חזקה מ-25 מטר!', failText: 'בעיטה חלשה לידי השוער.', good: 0.2, bad: -0.1 },
+          { label: 'מסירה בטוחה הצידה', tags: ['pass'], p: chanceP(pas, 0.8, 70), resolve: kept, value: 0.3, okText: 'שמרת על החזקה.', failText: 'מסירה רעה, איבדת כדור.', good: 0.08, bad: -0.25 },
+        ],
+      });
+      attackList.push({
+        title: 'כדור חופשי ב-28 מטר', desc: 'השופט שרק לעבירה ואתה לוקח את הבעיטה.',
+        options: [
+          { label: 'לבעוט ישר לשער', tags: ['shot'], p: chanceP(sho, 0.3, 40), resolve: shoot(0.08), value: 1, okText: 'בעיטה מסובבת מעל החומה...', failText: 'הכדור פגע בחומה.', good: 0.25, bad: -0.05 },
+          { label: 'להגביה לרחבה', tags: ['pass'], p: chanceP(pas, 0.5, 45), resolve: passTo(0.14), value: 1, okText: 'הגבהה מדויקת לראש!', failText: 'השוער אסף את ההגבהה.', good: 0.2, bad: -0.05 },
+        ],
+      });
+    }
+    if (g === 'D' && (slot === 'CB' || phy >= 70)) {
+      attackList.push({
+        title: 'קרן! עלית לרחבה', desc: 'הקשר שלך עומד לבעוט קרן, אתה בנקודת הפנדל.',
+        options: [
+          { label: 'נגיחה לשער', tags: ['aerial', 'shot'], p: chanceP((phy + sho) / 2, 0.3, 45), resolve: shoot(0.22), value: 1.3, okText: 'ניצחת בגובה ונגחת!', failText: 'הבלם היריב הרחיק.', good: 0.35, bad: -0.05 },
+          { label: 'לחסום את השוער לחבר', tags: ['aerial', 'pass'], p: chanceP(phy, 0.55, 50), resolve: passTo(0.18), value: 1, okText: 'פתחת שטח לחבר!', failText: 'השוער תפס.', good: 0.2, bad: -0.05 },
+        ],
+      });
+    }
+    return pick(attackList);
+  }
 
-    if (g === 'A' || (g === 'M' && rnd() < 0.5)) {
-      const moments = [
-        {
-          title: 'אתה ברחבה עם הכדור!',
-          desc: `קיבלת כדור בגובה 14 מטר, בלם של ${opp.club.name} מתקרב.`,
-          options: [
-            { label: 'בעיטה מיידית לפינה', p: chanceP(sho, 0.42, 45), resolve: shoot(0.16), value: 1.3, okText: 'בעיטה מדויקת למסגרת!', failText: 'הבעיטה עפה מעל.', good: 0.2, bad: -0.15 },
-            { label: 'לקחת נגיעה ולסדר את הבעיטה', p: chanceP((sho + dri) / 2, 0.32, 45), resolve: shoot(0.24), value: 1.5, okText: 'סידרת את עצמך מצוין ובעטת!', failText: 'הבלם חסם את הבעיטה.', good: 0.25, bad: -0.2 },
-            { label: 'מסירה לחבר פנוי', p: chanceP(pas, 0.6, 50), resolve: passTo(0.28), value: 0.9, okText: 'מסירה חכמה לחבר!', failText: 'המסירה נחתכה.', good: 0.2, bad: -0.15 },
-          ],
-        },
-        {
-          title: 'אחד על אחד עם השוער!',
-          desc: 'פרצת לבד, רק השוער לפניך.',
-          options: [
-            { label: 'לבעוט חזק', p: chanceP(sho, 0.55, 45), resolve: shoot(0.3), value: 1.4, okText: 'בעיטה חזקה...', failText: 'השוער סגר את הזווית.', good: 0.3, bad: -0.3 },
-            { label: 'לכדרר את השוער', p: chanceP(dri, 0.45, 45), resolve: (s, ok) => (ok ? shoot(0.32)(s, true) : 'lost'), value: 1.5, okText: 'עברת את השוער!', failText: 'השוער לקח לך את הכדור מהרגליים.', good: 0.4, bad: -0.35 },
-            { label: 'צ\'יפ מעל השוער', p: chanceP((sho + dri) / 2, 0.38, 40), resolve: shoot(0.33), value: 1.6, okText: 'צ\'יפ עדין...', failText: 'הצ\'יפ היה חלש מדי.', good: 0.45, bad: -0.3 },
-          ],
-        },
-        {
-          title: 'מתפרצת! אתה רץ עם הכדור',
-          desc: 'קיבלת כדור בחצי שלך ויש שטח פתוח לפניך.',
-          options: [
-            { label: 'לרוץ לבד לשער', p: chanceP((pac + dri) / 2, 0.4, 45), resolve: (s, ok) => (ok ? shoot(0.22)(s, true) : 'lost'), value: 1.3, okText: 'השארת את כולם מאחור!', failText: 'המגן השיג אותך.', good: 0.3, bad: -0.15 },
-            { label: 'מסירת עומק לחלוץ', p: chanceP(pas, 0.5, 45), resolve: passTo(0.3), value: 1.1, okText: 'מסירת עומק מושלמת!', failText: 'המסירה הייתה ארוכה מדי.', good: 0.3, bad: -0.1 },
-            { label: 'להאט ולחכות לחברים', p: 0.85, resolve: (s, ok) => (ok ? 'kept' : 'lost'), value: 0.2, okText: 'שמרת על הכדור.', failText: 'איבדת את הכדור.', good: 0.05 },
-          ],
-        },
-      ];
-      return pick(moments);
+  // ----- perks: unlocked abilities that improve (or add) options -----
+  const PERKS = {
+    finesse: { name: 'בעיטה מסובבת', desc: '+6% לבעיטות, ופותח "בעיטה מסובבת לחיבורים" ברחבה.', req: 'בעיטה 78', tags: ['shot'], bonus: 0.06, test: (p) => p.pos !== 'GK' && p.at[1] >= 78 },
+    speedster: { name: 'שד מהירות', desc: '+7% לריצות, ופותח ספרינט על הקו.', req: 'מהירות 82', tags: ['run'], bonus: 0.07, test: (p) => p.pos !== 'GK' && p.at[0] >= 82 },
+    playmaker: { name: 'מוח המשחק', desc: '+7% למסירות, ופותח "מסירת קסם".', req: 'מסירה 80', tags: ['pass'], bonus: 0.07, test: (p) => p.pos !== 'GK' && p.at[2] >= 80 },
+    dribbler: { name: 'קוסם', desc: '+7% לכדרורים, ופותח טריק רולטה.', req: 'כדרור 80', tags: ['dribble'], bonus: 0.07, test: (p) => p.pos !== 'GK' && p.at[3] >= 80 },
+    wall: { name: 'חומה', desc: '+7% לתיקולים וחסימות.', req: 'הגנה 78', tags: ['tackle', 'block'], bonus: 0.07, test: (p) => p.pos !== 'GK' && p.at[4] >= 78 },
+    aerial: { name: 'מלך האוויר', desc: '+8% לכדורי ראש.', req: 'פיזיות 78', tags: ['aerial'], bonus: 0.08, test: (p) => p.pos !== 'GK' && p.at[5] >= 78 },
+    penalty: { name: 'מומחה פנדלים', desc: '+10% בפנדלים.', req: 'בעיטה 74', tags: ['penalty'], bonus: 0.1, test: (p) => p.pos !== 'GK' && p.at[1] >= 74 },
+    reflexes: { name: 'רפלקסים', desc: '+7% להצלות.', req: 'רפלקסים 78 (שוער)', tags: ['save'], bonus: 0.07, test: (p) => p.pos === 'GK' && p.at[3] >= 78 },
+    clutch: { name: 'איש הרגעים הגדולים', desc: 'לחץ של סוף משחק לא משפיע עליך.', req: '3 שערים אחרי דקה 80, או דירוג 82', tags: [], bonus: 0, test: (p, pro) => (pro.lateGoals || 0) >= 3 || p.ovr >= 82 },
+    leader: { name: 'מנהיג', desc: 'אמון המאמן והמורל של הקבוצה עולים כל חודש.', req: 'קפטן הקבוצה', tags: [], bonus: 0, test: (p, pro) => !!pro.captain && pro.captain === p.c },
+  };
+
+  function finalizeMoment(sim, m) {
+    const st = sim.state;
+    const pro = st.pro;
+    if (!pro || m.injury) return m;
+    const me = st.players[sim.proId];
+    const perks = new Set(pro.perks || []);
+    const own = sim.sides[sim.proSide];
+    const opp = sim.sides[1 - sim.proSide];
+    const pressure = sim.minute >= 80 && Math.abs(own.goals - opp.goals) <= 1;
+    let pen = pressure ? 0.07 : 0;
+    if (perks.has('clutch')) pen = 0;
+    else if (pro.services && pro.services.psych) pen /= 2;
+    const chem = ((pro.chem || {})[me.c] || 0) / 100;
+    m.options = m.options.filter((o) => !o.perk || perks.has(o.perk));
+    for (const o of m.options) {
+      let bonus = 0;
+      for (const id of perks) {
+        const pk = PERKS[id];
+        if (pk && pk.bonus && (o.tags || []).some((t) => pk.tags.includes(t))) bonus += pk.bonus;
+      }
+      bonus = Math.min(0.1, bonus); // perks do not stack beyond +10%
+      if ((o.tags || []).includes('pass')) bonus += chem * 0.06;
+      o.base = o.p;
+      o.p = clamp(o.p + bonus - pen, 0.04, 0.95);
+      o.boost = Math.round(bonus * 100);
     }
-    // midfield / defender in possession
-    return pick([
-      {
-        title: 'יש לך את הכדור במרכז המגרש',
-        desc: 'לחץ של קשר יריב, חלוץ שלך מסמן לעומק.',
-        options: [
-          { label: 'מסירת עומק מסוכנת', p: chanceP(pas, 0.38, 45), resolve: passTo(0.25), value: 1.2, okText: 'מסירה פותחת הגנה!', failText: 'המסירה נחתכה.', good: 0.3, bad: -0.2 },
-          { label: 'בעיטה מרחוק', p: chanceP(sho, 0.35, 45), resolve: shoot(0.05), value: 0.8, okText: 'בעיטה חזקה מ-25 מטר!', failText: 'בעיטה חלשה לידי השוער.', good: 0.2, bad: -0.1 },
-          { label: 'מסירה בטוחה הצידה', p: chanceP(pas, 0.8, 70), resolve: (s, ok) => (ok ? 'kept' : 'lost'), value: 0.3, okText: 'שמרת על החזקה.', failText: 'מסירה רעה, איבדת כדור.', good: 0.08, bad: -0.25 },
-        ],
-      },
-      {
-        title: 'כדור חופשי ב-30 מטר',
-        desc: 'השופט שרק לעבירה ואתה לוקח את הבעיטה.',
-        options: [
-          { label: 'לבעוט ישר לשער', p: chanceP(sho, 0.3, 40), resolve: shoot(0.08), value: 1, okText: 'בעיטה מסובבת מעל החומה...', failText: 'הכדור פגע בחומה.', good: 0.25, bad: -0.05 },
-          { label: 'להגביה לרחבה', p: chanceP(pas, 0.5, 45), resolve: passTo(0.14), value: 1, okText: 'הגבהה מדויקת לראש!', failText: 'השוער אסף את ההגבהה.', good: 0.2, bad: -0.05 },
-        ],
-      },
-    ]);
+    m.pressure = pressure && pen > 0;
+    m.minute = sim.minute;
+    return m;
+  }
+
+  function injuryMoment(sim) {
+    const i = sim.proSide;
+    const p = sim.state.players[sim.proId];
+    return {
+      injury: true, title: 'נפגעת!', desc: 'קיבלת מכה חזקה בברך. הצוות הרפואי רץ אליך.',
+      options: [
+        { label: 'להמשיך לשחק דרך הכאב', tags: [], p: 0.65, resolve: (s, ok) => {
+          if (ok) return 'kept';
+          p.inj = rint(3, 6);
+          s.autoSub(i, sim.proId);
+          return 'injured';
+        }, okText: 'שיניים חזקות, אתה ממשיך!', failText: 'הכאב החמיר ונאלצת לצאת. פציעה ארוכה יותר.', good: 0.1, bad: -0.2 },
+        { label: 'לבקש חילוף', tags: [], p: 1, resolve: (s) => {
+          p.inj = rint(1, 2);
+          s.autoSub(i, sim.proId);
+          return 'subbed';
+        }, okText: 'יצאת בזמן. פציעה קלה.', failText: '', good: 0, bad: 0 },
+      ],
+    };
   }
 
   // Applies a finished match to tables, player stats, morale and club form.
@@ -1230,6 +1419,8 @@
       if (scorers) summary.topScorers[lg.id] = { pid: scorers.id, name: scorers.n, goals: scorers.st.gl };
     }
 
+    summary.awards = seasonAwards(state, summary.champions);
+
     // user outcome
     let fired = false;
     if (state.mode === 'manager') {
@@ -1296,6 +1487,7 @@
     state.history.unshift(summary);
     state.seasonYear++;
     startSeason(state);
+    if (state.pro) setObjectives(state);
     if (state.mode === 'manager' && !fired) {
       const u = state.user;
       u.expected = expectedPosition(state, u.clubId);
@@ -1382,9 +1574,13 @@
     p.ovr = proOvr(p);
     p.v = valueFor(p.ovr, p.age, p.pot);
     state.players[id] = p;
-    state.pro = { pid: id, xp: {}, focus: 1, intensity: 'normal', trust: 50, money: 0, career: [], log: [], lastRatings: [], offers: [], fame: 0, caps: 0 };
+    const w = PRO_WEIGHTS[proWeightKey(p.pos)];
+    const bestFocus = p.pos === 'GK' ? 3 : w.indexOf(Math.max(...w));
+    state.pro = { pid: id, xp: {}, focus: bestFocus, intensity: 'normal', trust: 50, money: 0, career: [], log: [], lastRatings: [], offers: [], fame: 0, caps: 0 };
     for (let i = 0; i < 6; i++) state.pro.xp[i] = 0;
+    Object.assign(state.pro, { perks: [], ach: {}, services: {}, bought: {}, chem: {}, fans: 50, lateGoals: 0, intlGoals: 0, contractRole: 'prospect' });
     initMonth(state);
+    setObjectives(state);
     const club = state.clubs[opts.clubId];
     message(state, `חתמת ${pre('ב', club.name)}!`, `ברוך הבא לקריירה. בגיל 17 אתה מתחיל כשחקן צעיר. תופיע במשחקים לפי הרמה שלך מול המתחרים בעמדה. בחר מוקד אימון כל שבוע כדי להשתפר.`, { kind: 'pro' });
     return p;
@@ -1409,6 +1605,14 @@
 
   function proMatchSim(state, fixture) {
     const p = state.players[state.pro.pid];
+    if (state.pro.painRisk) {
+      const risk = state.pro.painRisk;
+      state.pro.painRisk = 0;
+      if (rnd() < risk) {
+        p.inj = rint(3, 6);
+        message(state, 'הפציעה החמירה', `שיחקת דרך הכאב והפציעה החמירה. תיעדר ${p.inj} שבועות.`, { kind: 'pro' });
+      }
+    }
     const sim = new MatchSim(state, fixture.m.h, fixture.m.a, { detail: true, proId: p.id });
     sim.proSide = fixture.m.h === p.c ? 0 : 1;
     sim.proLog = [];
@@ -1465,10 +1669,135 @@
     return gains;
   }
 
+  // ---------- Be a Pro: career systems ----------
+  const ACHIEVEMENTS = {
+    debut: { name: 'הופעת בכורה', ico: '👕' },
+    first_goal: { name: 'שער ראשון', ico: '⚽' },
+    brace: { name: 'צמד', ico: '✌️' },
+    hat_trick: { name: 'שלושער', ico: '🎩' },
+    late_winner: { name: 'שער ניצחון בדקות הסיום', ico: '⏱️' },
+    goals_10: { name: '10 שערים בקריירה', ico: '🔟' },
+    goals_50: { name: '50 שערים בקריירה', ico: '🥈' },
+    goals_100: { name: '100 שערים בקריירה', ico: '💯' },
+    goals_200: { name: '200 שערים בקריירה', ico: '👑' },
+    apps_50: { name: '50 הופעות', ico: '🎖️' },
+    apps_100: { name: '100 הופעות', ico: '🏅' },
+    apps_250: { name: '250 הופעות', ico: '🏆' },
+    potm: { name: 'שחקן החודש', ico: '📅' },
+    first_cap: { name: 'הופעה ראשונה בנבחרת', ico: '🎌' },
+    intl_goal: { name: 'שער ראשון בנבחרת', ico: '🌍' },
+    captain: { name: 'קפטן', ico: '©️' },
+    champion: { name: 'אליפות', ico: '🏆' },
+    promoted: { name: 'עלייה ליגה', ico: '⬆️' },
+    golden_boot: { name: 'מלך השערים', ico: '👟' },
+    player_season: { name: 'שחקן העונה', ico: '⭐' },
+    young_player: { name: 'השחקן הצעיר של העונה', ico: '🌱' },
+    ballon_podium: { name: 'פודיום כדור הזהב', ico: '🥉' },
+    ballon_dor: { name: 'כדור הזהב', ico: '🥇' },
+    tournament_win: { name: 'זכייה בטורניר נבחרות', ico: '🌟' },
+    objectives: { name: 'עמדת בכל יעדי העונה', ico: '🎯' },
+  };
+  const SERVICES = {
+    trainer: { name: 'מאמן אישי', desc: '+25% נקודות ניסיון מאימונים ומשחקים.', weekly: 0.12 },
+    nutrition: { name: 'תזונאי', desc: 'חצי סיכון לפציעות באימונים ובמשחקים.', weekly: 0.08 },
+    physio: { name: 'פיזיותרפיסט פרטי', desc: 'חוזר מפציעות מהר פי 2.', weekly: 0.08 },
+    psych: { name: 'פסיכולוג ספורט', desc: 'חצי מהלחץ בדקות הסיום, ומורל עולה כל שבוע.', weekly: 0.06 },
+  };
+  const PURCHASES = {
+    car: { name: 'מכונית ספורט', desc: 'מוניטין +3, מורל +10.', cost: 90000, fame: 3, morale: 10 },
+    house: { name: 'בית עם בריכה', desc: 'מוניטין +6, מורל +20.', cost: 600000, fame: 6, morale: 20 },
+    academy: { name: 'אקדמיה לילדים בעיר הולדתך', desc: 'מוניטין +15, אוהדים +10.', cost: 2000000, fame: 15, fans: 10 },
+  };
+  const NATION_STRENGTH = {
+    Spain: 86, France: 86, Argentina: 86, England: 85, Brazil: 85, Portugal: 84, Germany: 84, Netherlands: 83, Italy: 82,
+    Belgium: 81, Croatia: 80, Uruguay: 79, Colombia: 78, Morocco: 78, 'United States': 76, Japan: 76, Denmark: 77, Switzerland: 77,
+    Senegal: 77, Mexico: 76, Norway: 76, Austria: 76, Turkey: 76, Serbia: 75, Ukraine: 75, Poland: 75, Nigeria: 74, Israel: 70,
+  };
+  const INTL_OPPONENTS = ['ספרד', 'צרפת', 'ארגנטינה', 'אנגליה', 'ברזיל', 'פורטוגל', 'גרמניה', 'הולנד', 'איטליה', 'בלגיה', 'קרואטיה', 'אורוגוואי', 'קולומביה', 'מרוקו', 'יפן', 'דנמרק', 'שווייץ', 'מקסיקו', 'נורבגיה', 'אוסטריה', 'טורקיה', 'סרביה', 'פולין', 'ויילס', 'סקוטלנד', 'יוון', 'צ\'כיה', 'אוקראינה', 'רומניה', 'אלבניה'];
+  function nationStrength(nat) {
+    return NATION_STRENGTH[nat] || 72;
+  }
+  function careerTotals(state) {
+    const pro = state.pro;
+    const p = state.players[pro.pid];
+    const t = { app: p.st.app, gl: p.st.gl, as: p.st.as };
+    for (const c of pro.career) {
+      t.app += c.st.app;
+      t.gl += c.st.gl;
+      t.as += c.st.as;
+    }
+    return t;
+  }
+  function unlock(state, id) {
+    const pro = state.pro;
+    pro.ach = pro.ach || {};
+    if (pro.ach[id]) return false;
+    pro.ach[id] = { season: state.seasonYear, week: state.week };
+    const a = ACHIEVEMENTS[id];
+    message(state, `הישג חדש: ${a.ico} ${a.name}`, 'נוסף לאוסף ההישגים שלך.', { kind: 'pro' });
+    pro.fame += 2;
+    return true;
+  }
+  function checkPerks(state) {
+    const pro = state.pro;
+    const p = state.players[pro.pid];
+    pro.perks = pro.perks || [];
+    const fresh = [];
+    for (const [id, pk] of Object.entries(PERKS)) {
+      if (!pro.perks.includes(id) && pk.test(p, pro)) {
+        pro.perks.push(id);
+        fresh.push(id);
+        message(state, `יכולת חדשה: ${pk.name}!`, pk.desc, { kind: 'pro' });
+      }
+    }
+    return fresh;
+  }
+  function checkMilestones(state) {
+    const pro = state.pro;
+    const t = careerTotals(state);
+    if (t.app >= 1) unlock(state, 'debut');
+    if (t.gl >= 1) unlock(state, 'first_goal');
+    for (const n of [10, 50, 100, 200]) if (t.gl >= n) unlock(state, `goals_${n}`);
+    for (const n of [50, 100, 250]) if (t.app >= n) unlock(state, `apps_${n}`);
+    if (pro.caps >= 1) unlock(state, 'first_cap');
+    if ((pro.intlGoals || 0) >= 1) unlock(state, 'intl_goal');
+  }
+
+  // Season objectives set by the club: goals/assists/apps/clean sheets and an average rating.
+  function setObjectives(state) {
+    const pro = state.pro;
+    const p = state.players[pro.pid];
+    const club = state.clubs[p.c];
+    const games = (state.fixtures[club.league] || []).length || 34;
+    const diff = p.ovr - club.rep;
+    const role = pro.contractRole || 'rotation';
+    const roleF = role === 'star' ? 1.25 : role === 'prospect' ? 0.7 : 1;
+    const key = proWeightKey(p.pos);
+    const obj = [];
+    const appT = Math.round(clamp(games * (0.45 + diff * 0.03) * roleF, 5, games * 0.85));
+    obj.push({ type: 'app', label: 'הופעות', target: appT });
+    if (key === 'A') obj.push({ type: 'gl', label: 'שערים', target: Math.round(clamp((games / 38) * (9 + diff * 0.9) * roleF, 2, 35)) });
+    else if (key === 'W') { obj.push({ type: 'gl', label: 'שערים', target: Math.round(clamp((games / 38) * (5 + diff * 0.5) * roleF, 1, 25)) }); obj.push({ type: 'as', label: 'בישולים', target: Math.round(clamp((games / 38) * (5 + diff * 0.4) * roleF, 1, 20)) }); }
+    else if (key === 'M') obj.push({ type: 'as', label: 'בישולים', target: Math.round(clamp((games / 38) * (4 + diff * 0.4) * roleF, 1, 18)) });
+    else obj.push({ type: 'cs', label: 'שערים נקיים', target: Math.round(clamp(appT * 0.3, 2, 20)) });
+    obj.push({ type: 'rt', label: 'ציון ממוצע', target: (role === 'star' ? 7.0 : 6.7) - (key === 'A' || key === 'W' ? 0 : 0.3) });
+    pro.objectives = { season: state.seasonYear, club: p.c, list: obj };
+  }
+  function objectiveProgress(state) {
+    const pro = state.pro;
+    const p = state.players[pro.pid];
+    if (!pro.objectives) return [];
+    return pro.objectives.list.map((o) => {
+      const cur = o.type === 'rt' ? (p.st.app ? p.st.rt / p.st.app : 0) : p.st[o.type] || 0;
+      return { ...o, current: o.type === 'rt' ? Math.round(cur * 100) / 100 : cur, done: cur >= o.target };
+    });
+  }
+
   function proAfterMatch(state, sim, ratings) {
     const pro = state.pro;
     const p = state.players[pro.pid];
     const side = sim.sides[sim.proSide];
+    const other = sim.sides[1 - sim.proSide];
     const mins = side.played[p.id] || 0;
     const rating = ratings[p.id];
     if (!mins) {
@@ -1477,55 +1806,161 @@
     }
     pro.lastRatings.push(rating);
     if (pro.lastRatings.length > 8) pro.lastRatings.shift();
-    const xp = Math.max(3, ((rating - 5.5) * 25 + mins / 6) * 0.45);
+    const trainerF = pro.services && pro.services.trainer ? 1.25 : 1;
+    const xp = Math.max(3, ((rating - 5.5) * 25 + mins / 6) * 0.45) * trainerF;
     // match XP is spread over the attributes used in the moments
     const used = new Set([pro.focus]);
-    for (const l of sim.proLog) {
-      if (/בעיט|צ'יפ/.test(l.choice)) used.add(1);
-      if (/מסיר|הגבה/.test(l.choice)) used.add(2);
-      if (/כדרר|לרוץ|נגיעה|לעצור/.test(l.choice)) used.add(3);
-      if (/תיקול|לחסום|לקפוץ|להוביל/.test(l.choice)) used.add(4);
-    }
+    const tagAttr = { shot: 1, penalty: 1, pass: 2, dribble: 3, run: 0, tackle: 4, block: 4, aerial: 5, save: 3 };
+    for (const l of sim.proLog) for (const t of l.tags || []) if (tagAttr[t] !== undefined) used.add(tagAttr[t]);
     const gains = [];
     for (const idx of used) gains.push(...trainingGain(state, idx, xp / used.size));
     pro.fame += Math.max(0, rating - 6.5) * 2 + (side.club.rep - 60) * 0.02;
+    pro.fans = clamp((pro.fans === undefined ? 50 : pro.fans) + (rating - 6.6) * 3, 0, 100);
+    pro.chem = pro.chem || {};
+    pro.chem[p.c] = Math.min(100, (pro.chem[p.c] || 0) + 2);
     p.v = valueFor(p.ovr, p.age, p.pot);
-    return { played: true, mins, rating, xp: Math.round(xp), gains, goals: sim.events.filter((e) => e.type === 'goal' && e.scorer === p.id).length };
+    const goals = sim.events.filter((e) => e.type === 'goal' && e.scorer === p.id);
+    if (goals.length >= 2) unlock(state, 'brace');
+    if (goals.length >= 3) unlock(state, 'hat_trick');
+    const late = goals.filter((e) => e.min >= 80).length;
+    pro.lateGoals = (pro.lateGoals || 0) + late;
+    if (late && side.goals === other.goals + 1 && goals.some((e) => e.min >= 85)) unlock(state, 'late_winner');
+    checkMilestones(state);
+    const newPerks = checkPerks(state);
+    return {
+      played: true, mins, rating, xp: Math.round(xp), gains, goals: goals.length,
+      assists: sim.events.filter((e) => e.type === 'goal' && e.assist === p.id).length,
+      decisions: sim.proLog.slice(), newPerks, score: [side.goals, other.goals], opp: other.club.name,
+    };
   }
 
   function proTrain(state) {
     const it = TRAINING_INTENSITY[state.pro.intensity] || TRAINING_INTENSITY.normal;
     const club = state.clubs[state.players[state.pro.pid].c];
-    const gains = trainingGain(state, state.pro.focus, 15 * it.dev * FACILITY_DEV[facilitiesOf(club)]);
+    const trainerF = state.pro.services && state.pro.services.trainer ? 1.25 : 1;
+    const gains = trainingGain(state, state.pro.focus, 15 * it.dev * FACILITY_DEV[facilitiesOf(club)] * trainerF);
     const p = state.players[state.pro.pid];
     p.v = valueFor(p.ovr, p.age, p.pot);
     return gains;
+  }
+
+  function serviceCost(state, id) {
+    const p = state.players[state.pro.pid];
+    return Math.max(300, Math.round((p.w * SERVICES[id].weekly) / 100) * 100);
+  }
+  function toggleService(state, id) {
+    const pro = state.pro;
+    pro.services = pro.services || {};
+    pro.services[id] = !pro.services[id];
+    return pro.services[id];
+  }
+  function buy(state, id) {
+    const pro = state.pro;
+    const it = PURCHASES[id];
+    pro.bought = pro.bought || {};
+    if (!it || pro.bought[id]) return { ok: false, reason: 'כבר קנית.' };
+    if ((pro.money || 0) < it.cost) return { ok: false, reason: `חסר לך ${money(it.cost - (pro.money || 0))}.` };
+    pro.money -= it.cost;
+    pro.bought[id] = state.seasonYear;
+    pro.fame += it.fame || 0;
+    if (it.fans) pro.fans = clamp((pro.fans || 50) + it.fans, 0, 100);
+    const p = state.players[pro.pid];
+    p.morale = clamp(p.morale + (it.morale || 0), 0, 100);
+    return { ok: true, reason: `קנית ${it.name}!` };
   }
 
   function proWeekly(state) {
     const pro = state.pro;
     const p = state.players[pro.pid];
     for (const g of proTrain(state)) {
-      message(state, 'השתפרת באימונים!', `${ATTR_HE[g.idx]} עלה. הדירוג הכללי שלך: ${g.ovr}.`, { kind: 'pro' });
+      message(state, 'השתפרת באימונים!', `${(p.pos === 'GK' ? GK_ATTR_HE : ATTR_HE)[g.idx]} עלה. הדירוג הכללי שלך: ${g.ovr}.`, { kind: 'pro' });
     }
-    // national team call-up
-    if ((state.week === 10 || state.week === 30) && p.ovr >= 76) {
-      pro.caps++;
-      message(state, 'זימון לנבחרת!', `נבחרת ${p.nat} זימנה אותך לחלון הנבחרות. סך הופעות: ${pro.caps}.`, { kind: 'pro' });
+    checkPerks(state);
+    // services cost money every week
+    for (const id of Object.keys(pro.services || {})) {
+      if (!pro.services[id]) continue;
+      const c = serviceCost(state, id);
+      if ((pro.money || 0) < c) {
+        pro.services[id] = false;
+        message(state, `${SERVICES[id].name} הפסיק לעבוד איתך`, 'לא היה מספיק כסף בחשבון.', { kind: 'pro' });
+      } else pro.money -= c;
     }
+    if (pro.services && pro.services.psych) p.morale = clamp(p.morale + 1, 0, 100);
+    if (pro.services && pro.services.physio && p.inj > 0) p.inj--;
+    pro.chem = pro.chem || {};
+    pro.chem[p.c] = Math.min(100, (pro.chem[p.c] || 0) + 0.5);
+    if (pro.perks && pro.perks.includes('leader')) squad(state, p.c).forEach((x) => { x.morale = clamp(x.morale + 0.3, 0, 100); });
+    // national team windows
+    if ([10, 18, 30].includes(state.week) && !pro.loanActive) maybeCallUp(state);
+    // transfer offers
     if (!windowOpen(state) || pro.offers.length) return;
     const avg = pro.lastRatings.length ? pro.lastRatings.reduce((s, v) => s + v, 0) / pro.lastRatings.length : 0;
     const club = state.clubs[p.c];
-    if (pro.lastRatings.length >= 4 && avg >= 6.9 && p.ovr >= club.rep - 3 && rnd() < 0.35) {
-      const offers = Object.values(state.clubs).filter((c) => c.id !== club.id && c.rep > club.rep && c.rep <= p.ovr + 5);
+    const wants = pro.transferRequest;
+    const eligible = pro.lastRatings.length >= 4 && (avg >= 6.9 || (wants && avg >= 6.5)) && p.ovr >= club.rep - (wants ? 6 : 3);
+    if (eligible && rnd() < (wants ? 0.6 : 0.35)) {
+      const offers = Object.values(state.clubs).filter((c) => c.id !== club.id && (c.rep > club.rep || wants) && c.rep <= p.ovr + (wants ? 3 : 5) && c.rep >= p.ovr - 12);
       const o = shuffle(offers).slice(0, rint(1, 2));
       for (const c of o) {
         const fee = Math.round((p.v * (1 + rnd() * 0.4)) / 10000) * 10000;
-        const wage = Math.round(Math.max(p.w * 1.5, wageFor(p.ovr)) / 100) * 100;
+        const wage = Math.round(Math.max(p.w * 1.3, wageFor(p.ovr)) / 100) * 100;
         pro.offers.push({ club: c.id, fee, wage });
-        message(state, `${c.name} רוצה אותך!`, `${c.name} הגישה הצעה של ${money(fee)} לקבוצה שלך. שכר מוצע: ${money(wage)} לשבוע.`, { kind: 'proOffer', offer: { club: c.id, fee, wage } });
+        message(state, `${c.name} רוצה אותך!`, `${c.name} הגישה הצעה של ${money(fee)} לקבוצה שלך. שכר פתיחה: ${money(wage)} לשבוע. אפשר לנהל משא ומתן.`, { kind: 'proOffer', offer: { club: c.id, fee, wage } });
       }
     }
+  }
+
+  // Contract negotiation on a transfer offer. wage: 'low' | 'fair' | 'high'; role: 'star' | 'rotation' | 'prospect'
+  function proNegotiate(state, clubId, terms) {
+    const pro = state.pro;
+    const offer = pro.offers.find((o) => o.club === clubId);
+    if (!offer) return { ok: false, text: 'ההצעה כבר לא בתוקף.' };
+    const p = state.players[pro.pid];
+    const club = state.clubs[clubId];
+    const wageF = { low: 0.9, fair: 1, high: 1.35 }[terms.wage] || 1;
+    let prob = { low: 0.97, fair: 0.85, high: 0.5 }[terms.wage] || 0.85;
+    if (terms.role === 'star') prob -= p.ovr >= club.rep + 2 ? 0.05 : 0.45;
+    if (terms.role === 'prospect' && p.age > 22) prob -= 0.3;
+    if (terms.clause) prob -= 0.12;
+    prob += Math.min(0.1, (pro.fame || 0) / 400);
+    if (rnd() > clamp(prob, 0.05, 0.99)) {
+      pro.offers = pro.offers.filter((o) => o.club !== clubId);
+      for (const m of state.inbox) if (m.kind === 'proOffer' && m.offer.club === clubId) m.done = 'rejected';
+      return { ok: false, text: `${club.name} לא הסכימה לתנאים וסגרה את המשא ומתן.` };
+    }
+    offer.wage = Math.round((offer.wage * wageF) / 100) * 100;
+    const text = proAcceptOffer(state, clubId);
+    pro.contractRole = terms.role || 'rotation';
+    pro.releaseClause = terms.clause ? Math.round((p.v * 2) / 100000) * 100000 : null;
+    pro.trust = terms.role === 'star' ? 70 : terms.role === 'prospect' ? 55 : 50;
+    pro.transferRequest = false;
+    setObjectives(state);
+    return { ok: true, text: `${text} שכר: ${money(p.w)} לשבוע, מעמד: ${{ star: 'כוכב', rotation: 'רוטציה', prospect: 'צעיר מבטיח' }[pro.contractRole]}.` };
+  }
+
+  function requestTransfer(state) {
+    const pro = state.pro;
+    pro.transferRequest = true;
+    pro.trust = clamp((pro.trust || 50) - 10, 0, 100);
+    return 'ביקשת העברה. המאמן לא מרוצה (אמון -10), אבל בחלון ההעברות יגיעו יותר הצעות.';
+  }
+  function requestLoan(state) {
+    const pro = state.pro;
+    const p = state.players[pro.pid];
+    if (pro.loanActive) return { ok: false, text: 'אתה כבר בהשאלה.' };
+    if (!windowOpen(state)) return { ok: false, text: 'אפשר לצאת להשאלה רק כשחלון ההעברות פתוח.' };
+    if (p.age > 23) return { ok: false, text: 'השאלות מיועדות לשחקנים עד גיל 23.' };
+    const parent = state.clubs[p.c];
+    const cands = Object.values(state.clubs).filter((c) => c.id !== parent.id && c.rep <= p.ovr + 2 && c.rep >= p.ovr - 7);
+    if (!cands.length) return { ok: false, text: 'לא נמצאה קבוצה מתאימה.' };
+    const club = pick(cands);
+    pro.career.push({ season: state.seasonYear, club: p.c, st: { ...p.st }, partial: true });
+    p.st = emptyStats();
+    pro.loanActive = { parent: parent.id, season: state.seasonYear };
+    p.c = club.id;
+    pro.trust = 60;
+    parent.lineup = null;
+    return { ok: true, text: `יצאת להשאלה ${pre('ל', club.name)} עד סוף העונה. שם תקבל דקות משחק.` };
   }
 
   function proAcceptOffer(state, clubId) {
@@ -1533,17 +1968,22 @@
     const offer = pro.offers.find((o) => o.club === clubId);
     if (!offer) return null;
     const p = state.players[pro.pid];
-    const from = state.clubs[p.c];
+    const from = state.clubs[pro.loanActive ? pro.loanActive.parent : p.c];
     from.balance += offer.fee;
     state.clubs[clubId].balance -= offer.fee;
     pro.career.push({ season: state.seasonYear, club: p.c, st: { ...p.st }, partial: true });
+    p.st = emptyStats();
     p.c = clubId;
     p.w = offer.wage;
     p.ctr = state.seasonYear + 4;
     p.morale = 85;
     pro.offers = [];
+    pro.loanActive = null;
+    pro.captain = null;
+    if (pro.perks) pro.perks = pro.perks.filter((x) => x !== 'leader');
     for (const m of state.inbox) if (m.kind === 'proOffer') m.done = m.offer.club === clubId ? 'accepted' : 'rejected';
     from.lineup = null;
+    initMonth(state);
     return `עברת ${pre('ל', state.clubs[clubId].name)}!`;
   }
   function proDeclineOffers(state) {
@@ -1551,12 +1991,232 @@
     for (const m of state.inbox) if (m.kind === 'proOffer' && !m.done) m.done = 'rejected';
   }
 
+  // ----- national team -----
+  function callUpThreshold(nat) {
+    return nationStrength(nat) - 8;
+  }
+  function maybeCallUp(state) {
+    const pro = state.pro;
+    const p = state.players[pro.pid];
+    if (p.inj > 0 || p.ovr < callUpThreshold(p.nat)) return;
+    const kind = state.week === 18 ? 'qualifier' : rnd() < 0.5 ? 'friendly' : 'qualifier';
+    state.pendingIntl = newIntlMatch(state, { kind, label: kind === 'friendly' ? 'משחק ידידות' : 'משחק מוקדמות' });
+    message(state, 'זימון לנבחרת!', `נבחרת ${p.nat} זימנה אותך ל${state.pendingIntl.label} מול ${state.pendingIntl.opp.name}.`, { kind: 'pro' });
+  }
+  function newIntlMatch(state, o) {
+    const p = state.players[state.pro.pid];
+    const us = nationStrength(p.nat);
+    const oppStrength = clamp(Math.round(us + gauss() * 5 + (o.stageBoost || 0)), 62, 88);
+    return {
+      kind: o.kind, label: o.label, tournament: o.tournament || null, stage: o.stage || 0, group: o.group || null,
+      opp: { name: pick(INTL_OPPONENTS), strength: oppStrength }, us, idx: 0, gf: 0, ga: 0, log: [], moments: 3,
+      current: null, done: false,
+    };
+  }
+  function intlMoment(state) {
+    const im = state.pendingIntl;
+    const p = state.players[state.pro.pid];
+    const [pac, sho, pas, dri, def, phy] = p.at;
+    const edge = (im.us - im.opp.strength) / 60;
+    const P = (attr, base) => clamp(base + (attr - im.opp.strength) / 70 + edge, 0.08, 0.9);
+    if (p.pos === 'GK') {
+      return { title: 'החלוץ היריב בועט!', desc: `${im.opp.name} מאיימת על השער שלך.`, options: [
+        { label: 'זינוק לפינה', effect: 'save', p: P(p.at[0], 0.5) },
+        { label: 'לצאת ולסגור זווית', effect: 'save', p: P(p.at[5], 0.48) },
+      ] };
+    }
+    const group = proWeightKey(p.pos);
+    if (group === 'D' || (group === 'DM' && rnd() < 0.6) || rnd() < 0.2) {
+      return { title: 'התקפה של היריבה', desc: `קשר של ${im.opp.name} מוביל לעבר הרחבה שלכם.`, options: [
+        { label: 'תיקול', effect: 'defend', p: P(def, 0.45) },
+        { label: 'לחסום את הבעיטה', effect: 'defend', p: P((def + phy) / 2, 0.52) },
+      ] };
+    }
+    return { title: 'יש לך הזדמנות!', desc: `הכדור אצלך מול ההגנה של ${im.opp.name}.`, options: [
+      { label: 'לבעוט', effect: 'goal', p: P(sho, 0.3) },
+      { label: 'לכדרר ולבעוט', effect: 'goal', p: P((dri + sho) / 2, 0.26) },
+      { label: 'מסירה לחלוץ', effect: 'assist', p: P(pas, 0.42) },
+    ] };
+  }
+  function intlNext(state) {
+    const im = state.pendingIntl;
+    if (!im || im.done) return null;
+    if (im.idx >= im.moments) return finishIntl(state);
+    im.current = intlMoment(state);
+    return im.current;
+  }
+  function answerIntl(state, optIdx) {
+    const im = state.pendingIntl;
+    if (!im || !im.current) return null;
+    const opt = im.current.options[optIdx];
+    const ok = rnd() < opt.p;
+    let text;
+    if (opt.effect === 'goal') {
+      if (ok) { im.gf++; state.pro.intlGoals = (state.pro.intlGoals || 0) + 1; text = 'גוול! כבשת לנבחרת!'; } else text = 'ההזדמנות לא נוצלה.';
+    } else if (opt.effect === 'assist') {
+      if (ok && rnd() < 0.6) { im.gf++; text = 'בישלת שער לנבחרת!'; } else text = ok ? 'מסירה טובה, אבל החלוץ החמיץ.' : 'המסירה נחתכה.';
+    } else if (ok) text = opt.effect === 'save' ? 'הצלה גדולה!' : 'עצרת את ההתקפה!';
+    else if (rnd() < 0.45) { im.ga++; text = 'היריבה כבשה...'; } else text = 'היריבה החמיצה, מזל.';
+    im.log.push({ q: im.current.title, a: opt.label, ok, text });
+    im.idx++;
+    im.current = null;
+    return { ok, text };
+  }
+  function poissonish(lambda) {
+    let k = 0;
+    let p = Math.exp(-lambda);
+    let s = p;
+    const u = rnd();
+    while (u > s && k < 8) { k++; p *= lambda / k; s += p; }
+    return k;
+  }
+  function finishIntl(state) {
+    const im = state.pendingIntl;
+    const ratio = im.us / im.opp.strength;
+    im.gf += poissonish(1.05 * Math.pow(ratio, 3));
+    im.ga += poissonish(1.0 / Math.pow(ratio, 3));
+    const knockout = im.tournament && im.stage >= 3;
+    if (knockout && im.gf === im.ga) {
+      im.pens = rnd() < 0.5 + (im.us - im.opp.strength) / 60;
+    }
+    const won = im.gf > im.ga || im.pens === true;
+    const pro = state.pro;
+    pro.caps = (pro.caps || 0) + 1;
+    pro.fame += won ? 2 : 0.5;
+    im.done = true;
+    im.result = won ? 'W' : im.gf === im.ga && !knockout ? 'D' : 'L';
+    checkMilestones(state);
+    return null;
+  }
+  // After a finished intl match: continue a tournament or clear it.
+  function closeIntl(state) {
+    const im = state.pendingIntl;
+    if (!im || !im.done) return null;
+    if (!im.tournament) {
+      state.pendingIntl = null;
+      return { over: true };
+    }
+    const t = im.tournament;
+    t.results.push({ stage: im.stage, opp: im.opp.name, gf: im.gf, ga: im.ga, pens: im.pens, result: im.result });
+    const stages = ['שלב הבתים 1', 'שלב הבתים 2', 'שלב הבתים 3', 'שמינית הגמר', 'רבע הגמר', 'חצי הגמר', 'הגמר'];
+    let next = im.stage + 1;
+    if (im.stage === 2) {
+      const pts = t.results.reduce((s, r) => s + (r.result === 'W' ? 3 : r.result === 'D' ? 1 : 0), 0);
+      if (pts < 4 && !(pts === 3 && rnd() < 0.5)) {
+        state.pendingIntl = null;
+        return { over: true, text: `הנבחרת הודחה בשלב הבתים של ${t.name} (${pts} נקודות).` };
+      }
+    } else if (im.stage >= 3 && im.result !== 'W') {
+      state.pendingIntl = null;
+      return { over: true, text: `הנבחרת הודחה ב${stages[im.stage]} של ${t.name}.` };
+    }
+    if (next >= stages.length) {
+      state.pendingIntl = null;
+      unlock(state, 'tournament_win');
+      state.pro.fame += 40;
+      return { over: true, won: true, text: `זכיתם ב${t.name}!!! 🏆` };
+    }
+    state.pendingIntl = newIntlMatch(state, { kind: 'tournament', label: `${t.name} - ${stages[next]}`, tournament: t, stage: next, stageBoost: next >= 3 ? next : 0 });
+    return { over: false };
+  }
+  function maybeTournament(state) {
+    const pro = state.pro;
+    if (!pro) return;
+    const p = state.players[pro.pid];
+    const year = state.seasonYear + 1; // summer after the season
+    const name = year % 4 === 2 ? `מונדיאל ${year}` : year % 4 === 0 ? `יורו ${year}` : null;
+    if (!name || p.ovr < callUpThreshold(p.nat) || p.inj > 0) return;
+    const qualified = nationStrength(p.nat) >= 76 || rnd() < 0.35;
+    if (!qualified) {
+      message(state, `הנבחרת לא העפילה ל${name}`, 'בפעם הבאה...', { kind: 'pro' });
+      return;
+    }
+    const t = { name, results: [] };
+    state.pendingIntl = newIntlMatch(state, { kind: 'tournament', label: `${name} - שלב הבתים 1`, tournament: t, stage: 0 });
+    message(state, `נבחרת ${p.nat} ב${name}!`, 'נבחרת לסגל לטורניר.', { kind: 'pro' });
+  }
+
+  // ----- injuries outside matches -----
+  function answerInjury(state, playThrough) {
+    const inj = state.pendingInjury;
+    if (!inj) return null;
+    const p = state.players[state.pro.pid];
+    state.pendingInjury = null;
+    if (playThrough) {
+      p.inj = 0;
+      state.pro.painRisk = 0.35;
+      return 'תשחק דרך הכאב. יש סיכון שהפציעה תחמיר.';
+    }
+    p.inj = inj.weeks;
+    return `תנוח ${inj.weeks} שבועות.`;
+  }
+
   function proSeasonEnd(state, summary) {
     const pro = state.pro;
     const p = state.players[pro.pid];
-    pro.career.push({ season: state.seasonYear, club: p.c, st: { ...p.st } });
+    // objectives
+    const prog = objectiveProgress(state);
+    if (prog.length) {
+      const met = prog.filter((o) => o.done).length;
+      const bonus = met * Math.round(p.w * 6);
+      pro.money = (pro.money || 0) + bonus;
+      pro.trust = clamp((pro.trust || 50) + (met - (prog.length - met)) * 4, 0, 100);
+      summary.proObjectives = { list: prog, met, bonus };
+      if (met === prog.length) unlock(state, 'objectives');
+    }
+    pro.career.push({ season: state.seasonYear, club: p.c, st: { ...p.st }, loan: !!pro.loanActive });
     summary.pro = { club: p.c, st: { ...p.st }, ovr: p.ovr };
     pro.offers = [];
+    // club honours
+    const lg = state.clubs[p.c].league;
+    if (summary.champions[lg] === p.c) unlock(state, 'champion');
+    if ((summary.promoted[lg] || []).includes(p.c)) unlock(state, 'promoted');
+    if (summary.topScorers[lg] && summary.topScorers[lg].pid === p.id) unlock(state, 'golden_boot');
+    const aw = summary.awards || {};
+    if (aw.season && aw.season[lg] && aw.season[lg].pid === p.id) unlock(state, 'player_season');
+    if (aw.young && aw.young[lg] && aw.young[lg].pid === p.id) unlock(state, 'young_player');
+    if (aw.ballon) {
+      const idx = aw.ballon.findIndex((b) => b.pid === p.id);
+      if (idx === 0) { unlock(state, 'ballon_dor'); pro.fame += 50; }
+      if (idx >= 0 && idx <= 2) unlock(state, 'ballon_podium');
+    }
+    // loan ends
+    if (pro.loanActive) {
+      p.c = pro.loanActive.parent;
+      pro.loanActive = null;
+      pro.trust = 55;
+      message(state, 'חזרת מההשאלה', `חזרת ${pre('ל', state.clubs[p.c].name)}.`, { kind: 'pro' });
+    }
+    pro.transferRequest = false;
+    maybeTournament(state);
+  }
+
+  // Season awards for every league plus a Ballon d'Or across all six countries.
+  function seasonAwards(state, champions) {
+    const season = {};
+    const young = {};
+    const ballon = [];
+    for (const lg of state.leagues) {
+      const games = (state.fixtures[lg.id] || []).length || 34;
+      let best = null;
+      let bestY = null;
+      for (const p of Object.values(state.players)) {
+        const c = state.clubs[p.c];
+        if (!c || c.league !== lg.id || p.st.app < games * 0.5) continue;
+        const score = p.st.rt / p.st.app + p.st.gl * 0.02 + p.st.as * 0.015;
+        const entry = { pid: p.id, name: p.n, club: p.c, rating: Math.round((p.st.rt / p.st.app) * 100) / 100, gl: p.st.gl, as: p.st.as, score };
+        if (!best || score > best.score) best = entry;
+        if (p.age <= 21 && (!bestY || score > bestY.score)) bestY = entry;
+        if (lg.tier === 1) {
+          const b = entry.rating * 10 + p.st.gl * 0.6 + p.st.as * 0.35 + (champions[lg.id] === p.c ? 8 : 0) + p.ovr * 0.25 + (lg.rep / 100) * 8;
+          ballon.push({ ...entry, score: b });
+        }
+      }
+      if (best) season[lg.id] = best;
+      if (bestY) young[lg.id] = bestY;
+    }
+    ballon.sort((a, b) => b.score - a.score);
+    return { season, young, ballon: ballon.slice(0, 5) };
   }
 
   // ---------- monthly cycle: review, awards, board confidence, decisions, training ----------
@@ -1660,9 +2320,9 @@
       const p = state.players[state.pro.pid];
       const it = TRAINING_INTENSITY[state.pro.intensity] || TRAINING_INTENSITY.normal;
       p.cond = Math.min(100, p.cond + it.recovery);
-      if (p.inj <= 0 && rnd() < it.injury * 1.5) {
-        p.inj = rint(1, 3);
-        message(state, 'נפצעת באימון', `תיעדר כ-${p.inj} שבועות. אימון קל יותר מקטין את הסיכון.`, { kind: 'pro' });
+      const nut = state.pro.services && state.pro.services.nutrition ? 0.5 : 1;
+      if (p.inj <= 0 && !state.pendingInjury && rnd() < it.injury * 1.5 * nut) {
+        state.pendingInjury = { weeks: rint(1, 3) };
       }
     }
   }
@@ -2125,6 +2785,28 @@
         return `חתמת! ${money(amount)} נכנסו לחשבון.`;
       },
     },
+    captaincy: {
+      mode: 'pro', weight: 6,
+      find(state) {
+        const pro = state.pro;
+        const p = state.players[pro.pid];
+        const atClub = pro.career.filter((c) => c.club === p.c).reduce((s, c) => s + c.st.app, 0) + p.st.app;
+        return !pro.captain && p.age >= 23 && (pro.trust || 50) >= 72 && (pro.fans || 50) >= 62 && atClub >= 25 ? {} : null;
+      },
+      build: () => ({
+        title: 'המאמן רוצה שתהיה הקפטן', body: 'הקפטן הנוכחי עוזב, והמאמן רוצה לתת לך את סרט הקפטן.',
+        options: [{ label: 'לקבל את הסרט', hint: 'יכולת "מנהיג", לחץ תקשורתי גדול יותר.' }, { label: 'לסרב בנימוס', hint: 'להתרכז במשחק שלך.' }],
+      }),
+      apply(state, p, o) {
+        const pro = state.pro;
+        if (o !== 0) return 'המאמן מבין.';
+        pro.captain = state.players[pro.pid].c;
+        pro.trust = clamp((pro.trust || 50) + 10, 0, 100);
+        unlock(state, 'captain');
+        checkPerks(state);
+        return 'אתה הקפטן החדש!';
+      },
+    },
     mentor: {
       mode: 'pro', weight: 2,
       find: (state) => (state.players[state.pro.pid].age <= 21 ? {} : null),
@@ -2200,6 +2882,8 @@
     makeOffer, askingPrice, acceptBid, rejectBid, releasePlayer, transfer,
     expectedPosition, jobOffers, takeJob, valueFor, wageFor,
     proStartOffers, createPro, proSquadRole, proMatchSim, proAfterMatch, proAcceptOffer, proDeclineOffers, proOvr, proWeightKey,
+    PERKS, ACHIEVEMENTS, SERVICES, PURCHASES, objectiveProgress, setObjectives, careerTotals, serviceCost, toggleService, buy,
+    proNegotiate, requestTransfer, requestLoan, intlNext, answerIntl, closeIntl, answerInjury, nationStrength, callUpThreshold, checkPerks, seasonAwards,
     money, seasonLabel, avgRating, message, pre,
     TRAINING_FOCUS, TRAINING_INTENSITY, facilitiesOf, facilityUpgradeCost, upgradeFacilities, setPlayerPlan, FACILITY_DEV, monthLabel, monthKeyOf, closeMonth, answerDecision, setTraining, trainingOf, initMonth,
   };

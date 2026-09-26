@@ -383,3 +383,5 @@ td.c, th.c { text-align: center; }
 .pitch2d-wrap { max-width: 820px; margin: 12px auto 0; border-radius: 16px; overflow: hidden; border: 1px solid var(--line2); box-shadow: var(--shadow); background: #174f30; }
 .pitch2d { display: block; width: 100%; }
 .pitch2d-wrap .lbls { display: flex; justify-content: space-between; padding: 6px 12px; font-size: 12px; color: var(--muted); direction: ltr; background: rgba(0, 0, 0, 0.3); }
+.decision .opt.perk { border-color: rgba(255, 201, 77, 0.55); background: rgba(255, 201, 77, 0.08); }
+.decision.injury h2 { color: #ff9d9d; }
